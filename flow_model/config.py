@@ -15,7 +15,7 @@ class Config:
     dropout: float = 0.1
     use_grad_checkpoint: bool = False
 
-    batch_size: int = 8
+    batch_size: int = 16
     lr: float = 2e-4
     epochs: int = 150
     val_frac: float = 0.2
