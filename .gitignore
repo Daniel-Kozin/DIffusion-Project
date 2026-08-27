@@ -1,0 +1,26 @@
+# data (transferred separately via rsync, not versioned)
+mri_images_3D/
+
+# training outputs / experiment artifacts
+checkpoints/
+checkpoints_smoke/
+checkpoints_test_print/
+wandb/
+screenshots/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local tooling / OS
+.claude/
+.DS_Store
+
+# LaTeX build artifacts
+latex/*.aux
+latex/*.fdb_latexmk
+latex/*.fls
+latex/*.log
+latex/*.out
+latex/*.synctex.gz
