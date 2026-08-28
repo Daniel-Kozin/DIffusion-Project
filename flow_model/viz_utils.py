@@ -113,16 +113,22 @@ def interpolation_step_figure(render_a: np.ndarray, render_b: np.ndarray, render
                                label_a: str = "A", label_b: str = "B",
                                render_a_top: Optional[np.ndarray] = None,
                                render_b_top: Optional[np.ndarray] = None,
-                               render_interp_top: Optional[np.ndarray] = None) -> plt.Figure:
+                               render_interp_top: Optional[np.ndarray] = None,
+                               pos_actual: Optional[Tuple[float, float]] = None) -> plt.Figure:
     """
     Left: the two endpoints plotted at their actual lump centroid location in the (H, W)
-    slice plane, connected by a dotted line, with a marker at the alpha-interpolated
-    position between them.
+    slice plane, connected by a dotted line, with a star at the alpha-interpolated
+    *expected* position between them (naive linear interpolation of the two endpoint
+    centroids) and, when pos_actual is given, a second marker at the lump centroid the
+    model *actually* generated for this alpha — a dotted line between the two makes the
+    gap between "expected" and "actual" directly visible.
     Right: A, B, and the interpolated render, angled view on top and top-down view
     below (top-down renders are optional; when omitted only the angled row is drawn).
 
     pos_a/pos_b: (w, h) lump centroid from lump_centroid_hw(), or None if that phantom
     has no lump voxels (falls back to the volume center, annotated as such).
+    pos_actual: (w, h) lump centroid of the actual generated interpolated volume, or None
+    if it has no lump voxels (or the caller doesn't have it) — nothing extra is drawn.
     """
     H, W = volume_hw
     fallback = (W / 2, H / 2)
@@ -142,7 +148,8 @@ def interpolation_step_figure(render_a: np.ndarray, render_b: np.ndarray, render
                  linestyle="dotted", color="gray", zorder=1)
     ax_left.scatter([pos_a_used[0]], [pos_a_used[1]], s=140, color="tab:blue", zorder=3)
     ax_left.scatter([pos_b_used[0]], [pos_b_used[1]], s=140, color="tab:orange", zorder=3)
-    ax_left.scatter([pos_interp[0]], [pos_interp[1]], s=220, color="tab:red", marker="*", zorder=4)
+    ax_left.scatter([pos_interp[0]], [pos_interp[1]], s=220, color="tab:red", marker="*", zorder=4,
+                     label="expected (linear)")
     label_a_text = label_a if pos_a is not None else f"{label_a} (no lump)"
     label_b_text = label_b if pos_b is not None else f"{label_b} (no lump)"
     # Point B's label away from A (and vice versa) so labels don't collide when the two
@@ -154,6 +161,15 @@ def interpolation_step_figure(render_a: np.ndarray, render_b: np.ndarray, render
     ax_left.annotate(label_b_text, pos_b_used, textcoords="offset points",
                       xytext=(10 + 6 * (dx > 0), 10 + 6 * (dy > 0)),
                       ha="left" if dx > 0 else "right", fontsize=10, color="tab:orange")
+
+    if pos_actual is not None:
+        ax_left.plot([pos_interp[0], pos_actual[0]], [pos_interp[1], pos_actual[1]],
+                     linestyle="dotted", color="tab:green", zorder=2, linewidth=1.5)
+        ax_left.scatter([pos_actual[0]], [pos_actual[1]], s=200, color="tab:green", marker="X", zorder=5,
+                        label="actual (generated)")
+        ax_left.annotate("actual", pos_actual, textcoords="offset points", xytext=(10, -10),
+                         ha="left", fontsize=10, color="tab:green")
+        ax_left.legend(loc="upper right", fontsize=8, framealpha=0.9)
     ax_left.annotate(f"alpha={alpha:.2f}", pos_interp, textcoords="offset points",
                       xytext=(16, 0), ha="left", va="center", fontsize=10, color="tab:red")
     ax_left.set_xlim(0, W)
@@ -209,12 +225,16 @@ def log_interpolation_step(tag: str, render_a: np.ndarray, render_b: np.ndarray,
                             label_a: str = "A", label_b: str = "B", lump_class: int = 3,
                             render_a_top: Optional[np.ndarray] = None,
                             render_b_top: Optional[np.ndarray] = None,
-                            render_interp_top: Optional[np.ndarray] = None) -> None:
+                            render_interp_top: Optional[np.ndarray] = None,
+                            vol_interp: Optional[torch.Tensor] = None) -> None:
     """
     vol_a/vol_b: label volumes [K, H, W] for the two endpoints, used to locate each
     phantom's lump centroid for the left-panel schematic.
     render_*_top: optional top-down renders of the same three volumes; when given, the
     figure gains a second row showing them below the default angled-view row.
+    vol_interp: the actual generated interpolated label volume [K, H, W] — when given, its
+    lump centroid is plotted alongside the naive expected (linearly-interpolated) position
+    so the two can be compared directly.
     """
     if wandb.run is None:
         print(f"[viz_utils] wandb.run is None, skipping log for '{tag}'")
@@ -225,11 +245,12 @@ def log_interpolation_step(tag: str, render_a: np.ndarray, render_b: np.ndarray,
 
     pos_a = lump_centroid_hw(vol_a, lump_class=lump_class)
     pos_b = lump_centroid_hw(vol_b, lump_class=lump_class)
+    pos_actual = lump_centroid_hw(vol_interp, lump_class=lump_class) if vol_interp is not None else None
     volume_hw = (vol_a.shape[-2], vol_a.shape[-1])
 
     fig = interpolation_step_figure(render_a, render_b, render_interp, alpha, pos_a, pos_b,
                                      volume_hw=volume_hw, label_a=label_a, label_b=label_b,
                                      render_a_top=render_a_top, render_b_top=render_b_top,
-                                     render_interp_top=render_interp_top)
+                                     render_interp_top=render_interp_top, pos_actual=pos_actual)
     wandb.log({tag: wandb.Image(fig)})
     plt.close(fig)

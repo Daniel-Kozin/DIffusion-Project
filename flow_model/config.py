@@ -10,6 +10,14 @@ class Config:
     checkpoint_dir: Path = Path("checkpoints")
 
     num_classes: int = 4
+    # Per-class weight on the flow-matching MSE loss, channel order matching the dataset's
+    # one-hot encoding (background, insert, pillar, lump). Plain per-voxel MSE treats a rare
+    # class exactly like background, so the model learns the bulk anatomy well but is
+    # inconsistent on rare classes (pillar is ~0.3% of voxels, lump ~0.9%, measured over the
+    # full dataset). Weights are sqrt(inverse class frequency), normalized to background=1 —
+    # sqrt rather than raw inverse frequency to avoid letting the ~150x-rarer pillar class
+    # dominate the loss and destabilize training. Override with --class_weights if needed.
+    class_weights: str = "1.0,1.03,12.57,7.36"
     base_ch: int = 8
     embed_channels: int = 16
     dropout: float = 0.1

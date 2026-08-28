@@ -179,7 +179,7 @@ def main():
                                     render_a, render_b, render_interp,
                                     alpha, phantom_a, phantom_b, case_a, case_b,
                                     render_a_top=render_a_top, render_b_top=render_b_top,
-                                    render_interp_top=render_interp_top)
+                                    render_interp_top=render_interp_top, vol_interp=label)
         print(f"Logged real interpolation pair {pair_idx} ({case_a} -> {case_b}).")
 
     # --- noise interpolation: reference renders are the decoded endpoint samples ---
@@ -199,7 +199,7 @@ def main():
                                     render_noise_a, render_noise_b, render_interp,
                                     alpha, z_a_label, z_b_label, "noise A", "noise B",
                                     render_a_top=render_noise_a_top, render_b_top=render_noise_b_top,
-                                    render_interp_top=render_interp_top)
+                                    render_interp_top=render_interp_top, vol_interp=label)
         print(f"Logged noise interpolation pair {pair_idx}.")
 
     print(f"Done: {args.n_pairs} real pairs and {args.n_pairs} noise pairs, "

@@ -3,6 +3,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -32,7 +33,25 @@ def get_device(preferred: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
-def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torch.device) -> torch.Tensor:
+def parse_class_weights(class_weights: str, device: torch.device) -> torch.Tensor:
+    """
+    'w0,w1,w2,w3' -> tensor([w0,w1,w2,w3]) broadcastable over the channel dim of
+    [B, C, K, H, W] velocity tensors. Channel order matches the dataset's one-hot
+    encoding: background, insert, pillar, lump.
+    """
+    weights = torch.tensor([float(w) for w in class_weights.split(",")], device=device)
+    return weights.view(1, -1, 1, 1, 1)
+
+
+def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torch.device,
+                        class_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    class_weights: optional [1, C, 1, 1, 1] per-channel weight (see parse_class_weights),
+    applied to the per-voxel squared error before averaging. Plain per-voxel MSE treats a
+    rare class (e.g. the lump, ~1% of voxels) exactly like background — getting it wrong
+    barely moves the average loss, which is why the model learns the bulk anatomy well but
+    is inconsistent on rare classes. Weighting by inverse class frequency corrects this.
+    """
     x1 = x1.to(device)
     x0 = torch.randn_like(x1)
     t = torch.rand(x1.shape[0], device=device)
@@ -41,16 +60,19 @@ def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torc
     xt = (1 - t_) * x0 + t_ * x1
     v_star = x1 - x0
     v_pred = model(xt, t)
-    return F.mse_loss(v_pred, v_star)
+    sq_err = (v_pred - v_star) ** 2
+    if class_weights is not None:
+        sq_err = sq_err * class_weights
+    return sq_err.mean()
 
 
-def train_one_epoch(model, loader, optimizer, device) -> float:
+def train_one_epoch(model, loader, optimizer, device, class_weights=None) -> float:
     model.train()
     total_loss = 0.0
     n = 0
     for batch in loader:
         optimizer.zero_grad()
-        loss = flow_matching_loss(model, batch, device)
+        loss = flow_matching_loss(model, batch, device, class_weights=class_weights)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * batch.shape[0]
@@ -59,12 +81,12 @@ def train_one_epoch(model, loader, optimizer, device) -> float:
 
 
 @torch.no_grad()
-def validate(model, loader, device) -> float:
+def validate(model, loader, device, class_weights=None) -> float:
     model.eval()
     total_loss = 0.0
     n = 0
     for batch in loader:
-        loss = flow_matching_loss(model, batch, device)
+        loss = flow_matching_loss(model, batch, device, class_weights=class_weights)
         total_loss += loss.item() * batch.shape[0]
         n += batch.shape[0]
     return total_loss / max(n, 1)
@@ -119,6 +141,9 @@ def main():
     device = get_device(config.device)
     print(f"[2/5] Using device: {device}")
 
+    class_weights = parse_class_weights(config.class_weights, device)
+    print(f"      class_weights (bg/insert/pillar/lump): {config.class_weights}")
+
     print(f"[3/5] Loading dataset from '{config.data_dir}' "
           f"(this can take a little while the first time)...")
     t0 = time.time()
@@ -162,8 +187,8 @@ def main():
     train_start = time.time()
     for epoch in range(config.epochs):
         epoch_start = time.time()
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = validate(model, val_loader, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, class_weights=class_weights)
+        val_loss = validate(model, val_loader, device, class_weights=class_weights)
         epoch_seconds = time.time() - epoch_start
 
         wandb.log({
