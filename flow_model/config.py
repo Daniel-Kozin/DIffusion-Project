@@ -28,7 +28,7 @@ class Config:
     run_tag: Optional[str] = None
 
     sample_every_epochs: int = 10
-    save_every_epochs: int = 10
+    save_every_epochs: int = 100
     n_train_sample_steps: int = 30
 
 

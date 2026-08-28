@@ -145,6 +145,14 @@ def main():
     if wandb.run is not None and getattr(wandb.run, "url", None):
         print(f"      wandb run URL: {wandb.run.url}")
 
+    # Checkpoints live inside this run's own wandb folder (rather than a shared top-level
+    # "checkpoints/" dir) so concurrent runs on the same machine can never collide on
+    # filenames and silently overwrite each other's saves.
+    if wandb.run is not None:
+        config.checkpoint_dir = Path(wandb.run.dir) / "checkpoints"
+    config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"      checkpoints -> {config.checkpoint_dir}")
+
     fixed_x0 = torch.randn(4, config.num_classes, 26, 128, 128, device=device)
 
     print("-" * 60)

@@ -1,4 +1,6 @@
+import fcntl
 import math
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import matplotlib
@@ -10,26 +12,41 @@ import wandb
 
 from visualize_inserts_3d import visualize_inserts_3d
 
+# visualize_inserts_3d's off-screen VTK rendering has no real X server to draw against on
+# this machine (see the "bad X server connection" warning) and isn't safe for concurrent
+# use: two processes rendering at once corrupt each other's screenshot buffer into static/
+# garbled output. This machine regularly runs multiple training/interpolation jobs at once
+# (one per GPU), so a cross-process file lock serializes actual render calls to avoid it.
+_RENDER_LOCK_PATH = Path("/tmp/diffusion_project_vtk_render.lock")
 
-def render_label_volumes(label_volumes: List[torch.Tensor], names: Optional[List[str]] = None) -> List[np.ndarray]:
+
+def render_label_volumes(label_volumes: List[torch.Tensor], names: Optional[List[str]] = None,
+                          look_up: bool = False) -> List[np.ndarray]:
     """
     label_volumes: list of int class-index tensors [K, H, W] (values 0-3).
+    look_up: use visualize_inserts_3d's top-down camera preset instead of the default
+        angled view.
     Returns a list of RGB screenshot arrays, one per volume.
     """
     if names is None:
         names = [f"vol_{i}" for i in range(len(label_volumes))]
 
-    vis = visualize_inserts_3d(off_screen=True, show_text=False)
-    for vol, name in zip(label_volumes, names):
-        vis.load_array(vol, name=name)
+    with open(_RENDER_LOCK_PATH, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            vis = visualize_inserts_3d(off_screen=True, show_text=False, look_up=look_up)
+            for vol, name in zip(label_volumes, names):
+                vis.load_array(vol, name=name)
+            imgs = vis.show()
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    imgs = vis.show()
     return imgs if imgs is not None else []
 
 
-def render_single(label_volume: torch.Tensor, name: str = "vol") -> Optional[np.ndarray]:
+def render_single(label_volume: torch.Tensor, name: str = "vol", look_up: bool = False) -> Optional[np.ndarray]:
     """Render a single label volume [K, H, W] to an RGB screenshot array."""
-    imgs = render_label_volumes([label_volume], [name])
+    imgs = render_label_volumes([label_volume], [name], look_up=look_up)
     return imgs[0] if imgs else None
 
 
@@ -93,12 +110,16 @@ def interpolation_step_figure(render_a: np.ndarray, render_b: np.ndarray, render
                                alpha: float, pos_a: Optional[Tuple[float, float]],
                                pos_b: Optional[Tuple[float, float]],
                                volume_hw: Tuple[int, int] = (128, 128),
-                               label_a: str = "A", label_b: str = "B") -> plt.Figure:
+                               label_a: str = "A", label_b: str = "B",
+                               render_a_top: Optional[np.ndarray] = None,
+                               render_b_top: Optional[np.ndarray] = None,
+                               render_interp_top: Optional[np.ndarray] = None) -> plt.Figure:
     """
     Left: the two endpoints plotted at their actual lump centroid location in the (H, W)
     slice plane, connected by a dotted line, with a marker at the alpha-interpolated
     position between them.
-    Right: A and B renders on top, the interpolated render centered below them.
+    Right: A, B, and the interpolated render, angled view on top and top-down view
+    below (top-down renders are optional; when omitted only the angled row is drawn).
 
     pos_a/pos_b: (w, h) lump centroid from lump_centroid_hw(), or None if that phantom
     has no lump voxels (falls back to the volume center, annotated as such).
@@ -110,8 +131,10 @@ def interpolation_step_figure(render_a: np.ndarray, render_b: np.ndarray, render
     pos_interp = ((1 - alpha) * pos_a_used[0] + alpha * pos_b_used[0],
                    (1 - alpha) * pos_a_used[1] + alpha * pos_b_used[1])
 
-    fig = plt.figure(figsize=(11, 5.5))
-    gs = fig.add_gridspec(2, 4, width_ratios=[1, 1, 1, 1])
+    has_top = render_a_top is not None and render_b_top is not None and render_interp_top is not None
+    n_right_rows = 2 if has_top else 1
+    fig = plt.figure(figsize=(13.5, 3 + 2.75 * n_right_rows))
+    gs = fig.add_gridspec(n_right_rows, 5, width_ratios=[1, 1, 1, 1, 1])
 
     # --- left: lump position schematic ---
     ax_left = fig.add_subplot(gs[:, 0:2])
@@ -140,32 +163,58 @@ def interpolation_step_figure(render_a: np.ndarray, render_b: np.ndarray, render
     ax_left.set_ylabel("H (voxels)")
     ax_left.set_title("Lump centroid position")
 
-    # --- right: A / B on top, interpolated result centered below ---
-    ax_a = fig.add_subplot(gs[0, 2])
-    ax_a.imshow(render_a)
-    ax_a.set_title(label_a, fontsize=10)
-    ax_a.axis("off")
+    # --- right: A / B / interpolated, angled view on row 0, top-down view on row 1 ---
+    # A/B panels get a colored title + border matching their dot color on the left schematic,
+    # so it's unambiguous which render corresponds to which endpoint.
+    interp_title = f"interpolated (alpha={alpha:.2f})"
+    colors = ["tab:blue", "tab:orange", None]
 
-    ax_b = fig.add_subplot(gs[0, 3])
-    ax_b.imshow(render_b)
-    ax_b.set_title(label_b, fontsize=10)
-    ax_b.axis("off")
+    def _render_panel(ax, img, title, color):
+        ax.imshow(img)
+        ax.set_title(title, fontsize=10, color=color if color else "black")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if color:
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_edgecolor(color)
+                spine.set_linewidth(3)
+        else:
+            for spine in ax.spines.values():
+                spine.set_visible(False)
 
-    ax_interp = fig.add_subplot(gs[1, 2:4])
-    ax_interp.imshow(render_interp)
-    ax_interp.set_title(f"interpolated (alpha={alpha:.2f})", fontsize=10)
-    ax_interp.axis("off")
+    row0 = [(label_a, render_a), (label_b, render_b), (interp_title, render_interp)]
+    for col, (title, img) in enumerate(row0):
+        ax = fig.add_subplot(gs[0, 2 + col])
+        _render_panel(ax, img, title, colors[col])
+
+    if has_top:
+        row1 = [(f"{label_a} (top)", render_a_top), (f"{label_b} (top)", render_b_top),
+                (f"{interp_title} (top)", render_interp_top)]
+        for col, (title, img) in enumerate(row1):
+            ax = fig.add_subplot(gs[1, 2 + col])
+            _render_panel(ax, img, title, colors[col])
 
     plt.tight_layout()
+    # wandb.Image() calls fig.savefig() without bbox_inches="tight", and long titles on the
+    # rightmost column (e.g. "interpolated (alpha=0.50) (top)") can extend past what
+    # tight_layout() reserved within the raw figsize, clipping the saved PNG. An explicit
+    # right margin guarantees the title fits without depending on the caller's savefig args.
+    fig.subplots_adjust(right=0.94, left=0.06)
     return fig
 
 
 def log_interpolation_step(tag: str, render_a: np.ndarray, render_b: np.ndarray, render_interp: np.ndarray,
                             alpha: float, vol_a: torch.Tensor, vol_b: torch.Tensor,
-                            label_a: str = "A", label_b: str = "B", lump_class: int = 3) -> None:
+                            label_a: str = "A", label_b: str = "B", lump_class: int = 3,
+                            render_a_top: Optional[np.ndarray] = None,
+                            render_b_top: Optional[np.ndarray] = None,
+                            render_interp_top: Optional[np.ndarray] = None) -> None:
     """
     vol_a/vol_b: label volumes [K, H, W] for the two endpoints, used to locate each
     phantom's lump centroid for the left-panel schematic.
+    render_*_top: optional top-down renders of the same three volumes; when given, the
+    figure gains a second row showing them below the default angled-view row.
     """
     if wandb.run is None:
         print(f"[viz_utils] wandb.run is None, skipping log for '{tag}'")
@@ -179,6 +228,8 @@ def log_interpolation_step(tag: str, render_a: np.ndarray, render_b: np.ndarray,
     volume_hw = (vol_a.shape[-2], vol_a.shape[-1])
 
     fig = interpolation_step_figure(render_a, render_b, render_interp, alpha, pos_a, pos_b,
-                                     volume_hw=volume_hw, label_a=label_a, label_b=label_b)
+                                     volume_hw=volume_hw, label_a=label_a, label_b=label_b,
+                                     render_a_top=render_a_top, render_b_top=render_b_top,
+                                     render_interp_top=render_interp_top)
     wandb.log({tag: wandb.Image(fig)})
     plt.close(fig)
