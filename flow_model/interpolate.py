@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--data_dir", type=Path, default=Path("mri_images_3D"))
     parser.add_argument("--n_steps", type=int, default=50)
     parser.add_argument("--alphas", type=float, nargs="+", default=[0.25, 0.5, 0.75])
-    parser.add_argument("--n_pairs", type=int, default=5,
+    parser.add_argument("--n_pairs", type=int, default=10,
                          help="Number of real-phantom pairs and number of noise pairs to interpolate "
                               "(each pair distinct; real pairs are drawn as distinct combinations of "
                               "validation case IDs, so individual phantoms may recur across pairs).")
