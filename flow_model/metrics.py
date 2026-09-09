@@ -63,3 +63,47 @@ def rotation_metrics(pred_label: torch.Tensor, expected_label: torch.Tensor,
         "pred_lump_components": count_components(pred_label, classes=(lump_class,)),
         "expected_lump_components": count_components(expected_label, classes=(lump_class,)),
     }
+
+
+@torch.no_grad()
+def directional_signal_metrics(model, x0_batch: torch.Tensor, x1_batch: torch.Tensor,
+                                t_values: Tuple[float, ...] = (0.1, 0.3, 0.7, 0.9)) -> Dict[str, float]:
+    """
+    Diagnostic on the RAW velocity prediction (before ODE integration/decoding): whether
+    v_pred = model(xt, t) points in the right direction and has the right magnitude relative
+    to the true target v_star = x1 - x0, restricted to voxels that actually need to change
+    (v_star != 0). This can reveal real learning progress well before it's strong enough to
+    flip the discrete decode after full ODE integration -- e.g. a model whose decoded output
+    still looks identical to x0 can already have a strongly correct (but too weak) directional
+    signal here.
+
+    t=0.5 is deliberately excluded from the default t_values: it's the exact 50/50 blend of
+    x0's and x1's one-hot vectors, a maximally ambiguous input where cosine similarity is
+    structurally near zero regardless of training quality -- not a meaningful signal to track.
+
+    x0_batch/x1_batch: [B, C, K, H, W] one-hot batches, already on model's device, model in
+    eval mode. Pools all "needs to change" voxels across the whole batch (not per-item) before
+    computing cosine similarity/magnitude ratio, for simplicity and to stay cheap on a large B.
+    Returns nan for both fields if no voxel in the batch needs to change (shouldn't happen on
+    real data).
+    """
+    v_star = x1_batch - x0_batch
+    changed_mask = (v_star.abs().sum(dim=1, keepdim=True) > 0).expand_as(v_star)
+    if not changed_mask.any():
+        return {"cos_sim_mean": float("nan"), "magnitude_ratio_mean": float("nan")}
+
+    cos_sims, mag_ratios = [], []
+    for t_val in t_values:
+        t = torch.full((x0_batch.shape[0],), t_val, device=x0_batch.device)
+        xt = (1 - t_val) * x0_batch + t_val * x1_batch
+        v_pred = model(xt, t)
+
+        vp = v_pred[changed_mask]
+        vs = v_star[changed_mask]
+        cos_sims.append(torch.nn.functional.cosine_similarity(vp.unsqueeze(0), vs.unsqueeze(0), dim=1).item())
+        mag_ratios.append((vp.abs().mean() / (vs.abs().mean() + 1e-8)).item())
+
+    return {
+        "cos_sim_mean": float(np.mean(cos_sims)),
+        "magnitude_ratio_mean": float(np.mean(mag_ratios)),
+    }

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from flow_model.data import RotationPairDataset, rotate_label_volume
-from flow_model.metrics import rotation_metrics
+from flow_model.metrics import directional_signal_metrics, rotation_metrics
 from flow_model.train import flow_matching_loss
 from flow_model.velocity_model import FlowMatchingUNet3D
 
@@ -58,3 +58,22 @@ def test_flow_matching_loss_with_real_x0_backward():
     assert torch.isfinite(loss)
     loss.backward()
     assert any(p.grad is not None for p in model.parameters())
+
+
+def test_directional_signal_metrics_shape_and_range():
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    model.eval()
+    x0 = torch.rand(2, 4, 26, 128, 128)
+    x1 = torch.rand(2, 4, 26, 128, 128)
+    m = directional_signal_metrics(model, x0, x1)
+    assert -1.0 - 1e-6 <= m["cos_sim_mean"] <= 1.0 + 1e-6
+    assert m["magnitude_ratio_mean"] >= 0.0
+
+
+def test_directional_signal_metrics_nan_when_nothing_changes():
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    model.eval()
+    x0 = torch.rand(1, 4, 26, 128, 128)
+    m = directional_signal_metrics(model, x0, x0.clone())  # x1 == x0 everywhere, no changed voxels
+    assert m["cos_sim_mean"] != m["cos_sim_mean"]  # NaN
+    assert m["magnitude_ratio_mean"] != m["magnitude_ratio_mean"]

@@ -38,9 +38,13 @@ class RotateConfig:
     wandb_mode: str = "online"
     run_tag: Optional[str] = "rotate180"
 
-    sample_every_epochs: int = 25  # drives periodic preview-figure + preview-metric logging
-    n_train_sample_steps: int = 30  # ODE steps for preview sampling (forward-only, no invert)
-    n_preview_val_pairs: int = 2
+    sample_every_epochs: int = 25  # drives periodic preview-figure + aggregate-metric logging
+    n_train_sample_steps: int = 30  # ODE steps for preview/metric sampling (forward-only, no invert)
+    n_preview_val_pairs: int = 5  # small set that gets the qualitative 6-image figure each time
+    # Larger fixed set used only for aggregate scalar metrics (mean/std graphed over epochs) --
+    # per-pair scalars are too noisy to read a trend off (see rotate180 diagnostic discussion),
+    # so this is deliberately much bigger than n_preview_val_pairs and never rendered as images.
+    n_metric_val_pairs: int = 50
     checkpoint_epochs: str = "100,250,500,1000"  # comma-string, mirrors class_weights convention
 
 

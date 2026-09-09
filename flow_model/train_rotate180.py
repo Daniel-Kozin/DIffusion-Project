@@ -16,10 +16,12 @@ from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import torch
 import wandb
 
 from .data import build_rotation_pair_dataloaders, build_rotation_pair_datasets
+from .metrics import directional_signal_metrics, rotation_metrics
 from .ode import sample
 from .rotate_config import get_rotate_config
 from .train import build_run_name, flow_matching_loss, get_device, parse_class_weights, save_checkpoint, set_seed
@@ -53,13 +55,64 @@ def validate_paired(model, loader, device, class_weights=None) -> float:
     return total_loss / max(n, 1)
 
 
-def pick_preview_indices(val_ds, n: int):
-    """Spreads n preview pairs across distinct val cases (index 0, len//n, 2*len//n, ...)
-    rather than adjacent orientations of the very same phantom."""
+def pick_spread_indices(val_ds, n: int):
+    """Spreads n indices across distinct val cases (index 0, len//n, 2*len//n, ...) rather
+    than adjacent orientations of the very same phantom. Used both for the small qualitative
+    preview set and the larger aggregate-metrics set."""
     if len(val_ds) == 0 or n <= 0:
         return []
+    n = min(n, len(val_ds))
     step = max(1, len(val_ds) // n)
     return [min(i * step, len(val_ds) - 1) for i in range(n)]
+
+
+@torch.no_grad()
+def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size: int) -> dict:
+    """Aggregates rotation_metrics (decoded, discrete) and directional_signal_metrics (raw
+    velocity, pre-decode) across all `indices`, processed in chunks of `chunk_size` to bound
+    GPU memory -- a single 50-item batch through the 3D UNet's activations would be far more
+    memory than the chunk_size the training batch itself was already tuned for. Returns
+    dataset-wide means/fractions, suitable for a single wandb.log call that becomes a proper
+    trend graph over epochs (unlike logging one scalar per individual pair, which is too
+    noisy pair-to-pair to read a trend off)."""
+    model.eval()
+    voxel_agreements, centroid_errors = [], []
+    pred_components, expected_components = [], []
+    cos_sims, mag_ratios = [], []
+    n_no_lump = 0
+
+    for start in range(0, len(indices), chunk_size):
+        chunk = indices[start:start + chunk_size]
+        x0_batch = torch.stack([val_ds[i][0] for i in chunk]).to(device)
+        x1_batch = torch.stack([val_ds[i][1] for i in chunk]).to(device)
+
+        x1_hat = sample(model, n_steps, x0=x0_batch, device=device, t_start=0.0, t_end=1.0)
+        pred_labels = x1_hat.argmax(dim=1).cpu()
+        expected_labels = x1_batch.argmax(dim=1).cpu()
+
+        for b in range(len(chunk)):
+            m = rotation_metrics(pred_labels[b], expected_labels[b])
+            voxel_agreements.append(m["voxel_agreement"])
+            if m["centroid_error_voxels"] is not None:
+                centroid_errors.append(m["centroid_error_voxels"])
+            if not m["pred_has_lump"]:
+                n_no_lump += 1
+            pred_components.append(m["pred_lump_components"])
+            expected_components.append(m["expected_lump_components"])
+
+        dsig = directional_signal_metrics(model, x0_batch, x1_batch)
+        cos_sims.append(dsig["cos_sim_mean"])
+        mag_ratios.append(dsig["magnitude_ratio_mean"])
+
+    return {
+        "voxel_agreement_mean": float(np.mean(voxel_agreements)),
+        "centroid_error_voxels_mean": float(np.mean(centroid_errors)) if centroid_errors else float("nan"),
+        "frac_predicted_no_lump": n_no_lump / len(indices),
+        "pred_lump_components_mean": float(np.mean(pred_components)),
+        "expected_lump_components_mean": float(np.mean(expected_components)),
+        "cos_sim_mean": float(np.nanmean(cos_sims)),
+        "magnitude_ratio_mean": float(np.nanmean(mag_ratios)),
+    }
 
 
 def main():
@@ -109,10 +162,12 @@ def main():
     print(f"      checkpoints -> {config.checkpoint_dir}")
 
     checkpoint_epoch_set = {int(e) for e in config.checkpoint_epochs.split(",") if e.strip()}
-    preview_indices = pick_preview_indices(val_ds, config.n_preview_val_pairs)
+    preview_indices = pick_spread_indices(val_ds, config.n_preview_val_pairs)
+    metric_indices = pick_spread_indices(val_ds, config.n_metric_val_pairs)
     preview_cases = [val_ds.index[idx][0] for idx in preview_indices]
     print(f"      checkpoint milestones: {sorted(checkpoint_epoch_set)}")
-    print(f"      preview pairs (val cases): {preview_cases}")
+    print(f"      preview pairs (val cases, qualitative images): {preview_cases}")
+    print(f"      metric pairs (aggregate scalars, graphed): {len(metric_indices)}")
 
     print("-" * 60)
     print(f"Training loop starting: {config.epochs} epochs")
@@ -148,7 +203,7 @@ def main():
 
         do_preview = (epoch_num % config.sample_every_epochs == 0) or epoch_num in (1, config.epochs)
         if do_preview and preview_indices:
-            print("  generating rotation preview for wandb...")
+            print(f"  generating {len(preview_indices)} qualitative rotation previews for wandb...")
             for i, idx in enumerate(preview_indices):
                 x0_i, x1_i = val_ds[idx]
                 case_id, variant_idx, orientation = val_ds.index[idx]
@@ -157,12 +212,25 @@ def main():
                 pred_label = x1_hat.argmax(dim=1)[0].cpu()
                 orig_label = x0_i.argmax(dim=0)
                 expected_label = x1_i.argmax(dim=0)
-                m = log_rotation_result(f"preview/pair{i}_{case_id}", orig_label, pred_label, expected_label)
-                if m is not None:
-                    log_dict = {f"preview/pair{i}/voxel_agreement": m["voxel_agreement"], "epoch": epoch}
-                    if m["centroid_error_voxels"] is not None:
-                        log_dict[f"preview/pair{i}/centroid_error_voxels"] = m["centroid_error_voxels"]
-                    wandb.log(log_dict)
+                log_rotation_result(f"preview/pair{i}_{case_id}", orig_label, pred_label, expected_label)
+
+        if do_preview and metric_indices:
+            print(f"  running aggregate metrics pass over {len(metric_indices)} val pairs...")
+            agg = run_diagnostic_pass(model, val_ds, metric_indices, device,
+                                       n_steps=config.n_train_sample_steps, chunk_size=config.batch_size)
+            wandb.log({
+                "epoch": epoch,
+                "metrics50/voxel_agreement_mean": agg["voxel_agreement_mean"],
+                "metrics50/centroid_error_voxels_mean": agg["centroid_error_voxels_mean"],
+                "metrics50/frac_predicted_no_lump": agg["frac_predicted_no_lump"],
+                "metrics50/pred_lump_components_mean": agg["pred_lump_components_mean"],
+                "metrics50/expected_lump_components_mean": agg["expected_lump_components_mean"],
+                "metrics50/cos_sim_mean": agg["cos_sim_mean"],
+                "metrics50/magnitude_ratio_mean": agg["magnitude_ratio_mean"],
+            })
+            print(f"    voxel_agreement={agg['voxel_agreement_mean']:.4f}  "
+                  f"centroid_error_voxels={agg['centroid_error_voxels_mean']:.2f}  "
+                  f"cos_sim={agg['cos_sim_mean']:.4f}  magnitude_ratio={agg['magnitude_ratio_mean']:.4f}")
 
         if epoch_num in checkpoint_epoch_set:
             save_checkpoint(config.checkpoint_dir / f"epoch_{epoch_num:04d}.pt", model, optimizer, epoch_num, config)
