@@ -22,6 +22,12 @@ class RotateConfig:
     # one free noise tensor, roughly doubling per-sample host memory vs. the unconditional
     # task's batch_size=16 default -- start conservative, bump after confirming headroom.
     batch_size: int = 8
+    # DataLoader worker processes for the CPU-side rotation/one-hot construction in
+    # RotationPairDataset.__getitem__ -- unlike the unconditional task (x0 is free noise,
+    # cheap to generate on the fly), every item here does two torchvision rotations, so a
+    # single-process loader (num_workers=0) can leave the GPU underfed. 0 disables
+    # multiprocessing entirely (safest default, matches every other script in this repo).
+    num_workers: int = 0
     lr: float = 2e-4
     epochs: int = 1000
     val_frac: float = 0.2

@@ -83,7 +83,8 @@ def main():
     t0 = time.time()
     train_ds, val_ds = build_rotation_pair_datasets(config.data_dir, val_frac=config.val_frac,
                                                       seed=config.seed, num_classes=config.num_classes)
-    train_loader, val_loader = build_rotation_pair_dataloaders(train_ds, val_ds, batch_size=config.batch_size)
+    train_loader, val_loader = build_rotation_pair_dataloaders(train_ds, val_ds, batch_size=config.batch_size,
+                                                                num_workers=config.num_workers)
     print(f"      done in {time.time() - t0:.1f}s — train pairs: {len(train_ds)}, val pairs: {len(val_ds)}")
 
     print("[4/5] Building model...")
@@ -125,6 +126,12 @@ def main():
         val_loss = validate_paired(model, val_loader, device, class_weights=class_weights)
         epoch_seconds = time.time() - epoch_start
 
+        elapsed = time.time() - train_start
+        remaining_epochs = config.epochs - epoch_num
+        avg_epoch_seconds = elapsed / epoch_num
+        eta_seconds = remaining_epochs * avg_epoch_seconds
+        eta = timedelta(seconds=int(eta_seconds))
+
         wandb.log({
             "train/loss": train_loss,
             "val/loss": val_loss,
@@ -133,12 +140,9 @@ def main():
             "epochs_total": config.epochs,
             "progress": epoch_num / config.epochs,
             "epoch_seconds": epoch_seconds,
+            "eta_seconds": eta_seconds,
         })
 
-        elapsed = time.time() - train_start
-        remaining_epochs = config.epochs - epoch_num
-        avg_epoch_seconds = elapsed / epoch_num
-        eta = timedelta(seconds=int(remaining_epochs * avg_epoch_seconds))
         print(f"epoch {epoch_num}/{config.epochs}  train_loss={train_loss:.4f}  "
               f"val_loss={val_loss:.4f}  ({epoch_seconds:.1f}s/epoch, ETA {eta})")
 
