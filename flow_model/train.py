@@ -44,8 +44,13 @@ def parse_class_weights(class_weights: str, device: torch.device) -> torch.Tenso
 
 
 def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torch.device,
+                        x0: Optional[torch.Tensor] = None,
                         class_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
+    x0: optional source batch (same shape as x1). Defaults to Gaussian noise (the standard
+    unconditional flow-matching source) when omitted, preserving this function's original
+    behavior for every existing caller. Pass a real batch to train a paired flow (e.g. the
+    180-degree-rotation task in train_rotate180.py), where x0 is real data rather than noise.
     class_weights: optional [1, C, 1, 1, 1] per-channel weight (see parse_class_weights),
     applied to the per-voxel squared error before averaging. Plain per-voxel MSE treats a
     rare class (e.g. the lump, ~1% of voxels) exactly like background — getting it wrong
@@ -53,7 +58,7 @@ def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torc
     is inconsistent on rare classes. Weighting by inverse class frequency corrects this.
     """
     x1 = x1.to(device)
-    x0 = torch.randn_like(x1)
+    x0 = torch.randn_like(x1) if x0 is None else x0.to(device)
     t = torch.rand(x1.shape[0], device=device)
     t_ = t.view(-1, 1, 1, 1, 1)
 

@@ -115,3 +115,55 @@ def build_dataloaders(train_ds: PhantomDataset, val_ds: PhantomDataset,
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     return train_loader, val_loader
+
+
+class RotationPairDataset(Dataset):
+    """Yields (x0, x1) one-hot pairs where x1 is the exact 180-degree-rotated counterpart of
+    x0 (same underlying case/variant, orientation shifted by exactly 4 steps of 45 degrees).
+    Bidirectional: every one of the 8 orientations appears as x0 (each paired with its
+    (o+4)%8 opposite as x1), so o->o+4 and o+4->o both appear as separate examples. Unlike
+    PhantomDataset, this is used unaugmented-vs-augmented identically for train and val --
+    orientation is the task variable here, not an augmentation nuisance."""
+
+    def __init__(self, case_volumes: Dict[str, List[np.ndarray]], case_ids: List[str],
+                 num_classes: int = 4):
+        self.case_volumes = case_volumes
+        self.num_classes = num_classes
+
+        self.index: List[Tuple[str, int, int]] = []  # (case_id, variant_idx, orientation_of_x0)
+        for case_id in case_ids:
+            for variant_idx in range(len(case_volumes[case_id])):
+                for orientation in range(8):
+                    self.index.append((case_id, variant_idx, orientation))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _one_hot(self, label: np.ndarray) -> torch.Tensor:
+        label_t = torch.from_numpy(label.copy()).long()  # [K, H, W]
+        one_hot = F.one_hot(label_t, num_classes=self.num_classes)  # [K, H, W, C]
+        return one_hot.permute(3, 0, 1, 2).float()  # [C, K, H, W]
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        case_id, variant_idx, orientation = self.index[idx]
+        raw = self.case_volumes[case_id][variant_idx]
+        x0 = self._one_hot(rotate_label_volume(raw, orientation))
+        x1 = self._one_hot(rotate_label_volume(raw, (orientation + 4) % 8))
+        return x0, x1
+
+
+def build_rotation_pair_datasets(data_dir: Path, val_frac: float = 0.2, seed: int = 0,
+                                  num_classes: int = 4) -> Tuple[RotationPairDataset, RotationPairDataset]:
+    case_volumes = load_all_volumes(data_dir)
+    train_ids, val_ids = split_case_ids(list(case_volumes.keys()), val_frac=val_frac, seed=seed)
+
+    train_ds = RotationPairDataset(case_volumes, train_ids, num_classes=num_classes)
+    val_ds = RotationPairDataset(case_volumes, val_ids, num_classes=num_classes)
+    return train_ds, val_ds
+
+
+def build_rotation_pair_dataloaders(train_ds: RotationPairDataset, val_ds: RotationPairDataset,
+                                     batch_size: int = 2, num_workers: int = 0) -> Tuple[DataLoader, DataLoader]:
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    return train_loader, val_loader

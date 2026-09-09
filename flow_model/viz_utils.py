@@ -1,7 +1,7 @@
 import fcntl
 import math
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -11,6 +11,8 @@ import torch
 import wandb
 
 from visualize_inserts_3d import visualize_inserts_3d
+
+from .metrics import lump_centroid_hw, rotation_metrics
 
 # visualize_inserts_3d's off-screen VTK rendering has no real X server to draw against on
 # this machine (see the "bad X server connection" warning) and isn't safe for concurrent
@@ -48,21 +50,6 @@ def render_single(label_volume: torch.Tensor, name: str = "vol", look_up: bool =
     """Render a single label volume [K, H, W] to an RGB screenshot array."""
     imgs = render_label_volumes([label_volume], [name], look_up=look_up)
     return imgs[0] if imgs else None
-
-
-def lump_centroid_hw(label_volume: torch.Tensor, lump_class: int = 3) -> Optional[Tuple[float, float]]:
-    """
-    Centroid of the lump voxels in a label volume [K, H, W], projected onto the (H, W)
-    plane (averaged over depth). Returns (w, h) so it plots naturally on an (x, y) axis,
-    or None if the volume has no voxels of `lump_class`.
-    """
-    mask = (label_volume == lump_class)
-    if mask.sum() == 0:
-        return None
-    coords = mask.nonzero(as_tuple=False).float()  # [N, 3] -> (k, h, w) indices
-    h = coords[:, 1].mean().item()
-    w = coords[:, 2].mean().item()
-    return (w, h)
 
 
 def grid_figure(imgs: List[np.ndarray], titles: Optional[List[str]] = None,
@@ -254,3 +241,148 @@ def log_interpolation_step(tag: str, render_a: np.ndarray, render_b: np.ndarray,
                                      render_interp_top=render_interp_top, pos_actual=pos_actual)
     wandb.log({tag: wandb.Image(fig)})
     plt.close(fig)
+
+
+def rotation_result_figure(render_orig: np.ndarray, render_pred: np.ndarray, render_expected: np.ndarray,
+                            pos_orig: Optional[Tuple[float, float]], pos_pred: Optional[Tuple[float, float]],
+                            pos_expected: Optional[Tuple[float, float]],
+                            volume_hw: Tuple[int, int] = (128, 128),
+                            render_orig_top: Optional[np.ndarray] = None,
+                            render_pred_top: Optional[np.ndarray] = None,
+                            render_expected_top: Optional[np.ndarray] = None,
+                            metrics: Optional[Dict] = None) -> plt.Figure:
+    """
+    Left: three lump-centroid markers -- original (blue), expected/ground-truth 180-degree
+    position (orange), and the model's predicted position (green X, same "actual/generated"
+    visual language as interpolation_step_figure's green-X marker). A dotted gray line
+    original->expected shows the true 180-degree path; a dotted green line expected->predicted
+    makes the model's error directly visible as a gap.
+    Right: original / predicted / expected renders, angled view on top and (if given) a
+    top-down row below -- 6 images total when both angles are supplied.
+
+    pos_*: (w, h) lump centroid from lump_centroid_hw(), or None if that volume has no lump
+    voxels (falls back to the volume center, annotated as such).
+    metrics: optional dict from metrics.rotation_metrics() -- when given, voxel agreement and
+    centroid error are annotated as a text box on the left panel.
+    """
+    H, W = volume_hw
+    fallback = (W / 2, H / 2)
+    pos_orig_used = pos_orig if pos_orig is not None else fallback
+    pos_pred_used = pos_pred if pos_pred is not None else fallback
+    pos_expected_used = pos_expected if pos_expected is not None else fallback
+
+    has_top = render_orig_top is not None and render_pred_top is not None and render_expected_top is not None
+    n_right_rows = 2 if has_top else 1
+    fig = plt.figure(figsize=(13.5, 3 + 2.75 * n_right_rows))
+    gs = fig.add_gridspec(n_right_rows, 5, width_ratios=[1, 1, 1, 1, 1])
+
+    # --- left: original / predicted / expected lump position schematic ---
+    ax_left = fig.add_subplot(gs[:, 0:2])
+    ax_left.plot([pos_orig_used[0], pos_expected_used[0]], [pos_orig_used[1], pos_expected_used[1]],
+                 linestyle="dotted", color="gray", zorder=1)
+    ax_left.plot([pos_expected_used[0], pos_pred_used[0]], [pos_expected_used[1], pos_pred_used[1]],
+                 linestyle="dotted", color="tab:green", zorder=2, linewidth=1.5)
+    ax_left.scatter([pos_orig_used[0]], [pos_orig_used[1]], s=140, color="tab:blue", zorder=3,
+                     label="original")
+    ax_left.scatter([pos_expected_used[0]], [pos_expected_used[1]], s=200, color="tab:orange",
+                     marker="*", zorder=4, label="expected (true 180°)")
+    ax_left.scatter([pos_pred_used[0]], [pos_pred_used[1]], s=160, color="tab:green", marker="X",
+                     zorder=5, label="predicted")
+
+    def _label(pos, given, text, color, dx_ref, dy_ref):
+        text = text if given is not None else f"{text} (no lump)"
+        ax_left.annotate(text, pos, textcoords="offset points",
+                          xytext=(-10 - 6 * (dx_ref > 0), -10 - 6 * (dy_ref > 0)),
+                          ha="right" if dx_ref > 0 else "left", fontsize=10, color=color)
+
+    dx, dy = pos_expected_used[0] - pos_orig_used[0], pos_expected_used[1] - pos_orig_used[1]
+    _label(pos_orig_used, pos_orig, "original", "tab:blue", -dx, -dy)
+    _label(pos_expected_used, pos_expected, "expected", "tab:orange", dx, dy)
+    _label(pos_pred_used, pos_pred, "predicted", "tab:green",
+           pos_pred_used[0] - pos_expected_used[0], pos_pred_used[1] - pos_expected_used[1])
+
+    ax_left.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    if metrics is not None:
+        agreement = metrics.get("voxel_agreement")
+        centroid_err = metrics.get("centroid_error_voxels")
+        text = f"voxel agreement: {agreement:.1%}" if agreement is not None else "voxel agreement: n/a"
+        text += "\ncentroid error: " + (f"{centroid_err:.1f} vox" if centroid_err is not None else "n/a")
+        ax_left.text(0.02, 0.02, text, transform=ax_left.transAxes, fontsize=9, va="bottom", ha="left",
+                     bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="gray"))
+    ax_left.set_xlim(0, W)
+    ax_left.set_ylim(H, 0)  # inverted so row 0 is at the top, matching image orientation
+    ax_left.set_aspect("equal")
+    ax_left.set_xlabel("W (voxels)")
+    ax_left.set_ylabel("H (voxels)")
+    ax_left.set_title("Lump centroid position")
+
+    # --- right: original / predicted / expected, angled view on row 0, top-down on row 1 ---
+    colors = ["tab:blue", "tab:green", "tab:orange"]
+
+    def _render_panel(ax, img, title, color):
+        ax.imshow(img)
+        ax.set_title(title, fontsize=10, color=color)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_edgecolor(color)
+            spine.set_linewidth(3)
+
+    row0 = [("original", render_orig), ("predicted", render_pred), ("expected", render_expected)]
+    for col, (title, img) in enumerate(row0):
+        ax = fig.add_subplot(gs[0, 2 + col])
+        _render_panel(ax, img, title, colors[col])
+
+    if has_top:
+        row1 = [("original (top)", render_orig_top), ("predicted (top)", render_pred_top),
+                ("expected (top)", render_expected_top)]
+        for col, (title, img) in enumerate(row1):
+            ax = fig.add_subplot(gs[1, 2 + col])
+            _render_panel(ax, img, title, colors[col])
+
+    plt.tight_layout()
+    # See interpolation_step_figure's identical note: wandb.Image() savefig()'s without
+    # bbox_inches="tight", so an explicit margin guarantees titles aren't clipped.
+    fig.subplots_adjust(right=0.94, left=0.06)
+    return fig
+
+
+def log_rotation_result(tag: str, orig_label: torch.Tensor, pred_label: torch.Tensor,
+                         expected_label: torch.Tensor, lump_class: int = 3,
+                         top_down: bool = True) -> Optional[Dict]:
+    """
+    orig_label/pred_label/expected_label: label volumes [K, H, W]. Renders all three in one
+    batched render_label_volumes() call (angled) plus, if top_down, one more (look_up=True) --
+    2 render calls / VTK-lock acquisitions total for up to 6 images, rather than 6 individual
+    render_single() calls. Computes metrics.rotation_metrics(pred_label, expected_label),
+    builds rotation_result_figure(), logs it to wandb, and returns the metrics dict (unlike
+    log_interpolation_step's `-> None`) since both train_rotate180.py's periodic preview and
+    eval_rotate180.py's aggregation need this same dict, computed once rather than twice.
+    """
+    m = rotation_metrics(pred_label, expected_label, lump_class=lump_class)
+
+    if wandb.run is None:
+        print(f"[viz_utils] wandb.run is None, skipping log for '{tag}'")
+        return m
+
+    vols = [orig_label, pred_label, expected_label]
+    names = [f"{tag}_original", f"{tag}_predicted", f"{tag}_expected"]
+    renders = render_label_volumes(vols, names=names, look_up=False)
+    renders_top = render_label_volumes(vols, names=names, look_up=True) if top_down else [None, None, None]
+    if len(renders) != 3 or (top_down and len(renders_top) != 3):
+        print(f"[viz_utils] missing render(s), skipping log for '{tag}'")
+        return m
+
+    pos_orig = lump_centroid_hw(orig_label, lump_class=lump_class)
+    pos_pred = lump_centroid_hw(pred_label, lump_class=lump_class)
+    pos_expected = lump_centroid_hw(expected_label, lump_class=lump_class)
+    volume_hw = (orig_label.shape[-2], orig_label.shape[-1])
+
+    fig = rotation_result_figure(renders[0], renders[1], renders[2], pos_orig, pos_pred, pos_expected,
+                                  volume_hw=volume_hw,
+                                  render_orig_top=renders_top[0], render_pred_top=renders_top[1],
+                                  render_expected_top=renders_top[2], metrics=m)
+    wandb.log({tag: wandb.Image(fig)})
+    plt.close(fig)
+    return m

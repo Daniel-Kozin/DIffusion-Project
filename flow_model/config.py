@@ -40,10 +40,15 @@ class Config:
     n_train_sample_steps: int = 30
 
 
-def get_config() -> Config:
-    parser = argparse.ArgumentParser(description="Flow matching training config")
-    defaults = Config()
-    for f in fields(Config):
+def build_config_from_cli(cls, description: str = ""):
+    """Auto-builds an argparse CLI from a dataclass's fields: every field becomes a
+    --field_name flag defaulting to the dataclass's own default. Path fields get type=Path,
+    bool fields get a truthy-string parser, everything else uses the default value's type
+    (or str if the default is None). Shared by Config (training) and any other dataclass-
+    based CLI config (e.g. RotateConfig) so the reflection logic isn't duplicated."""
+    parser = argparse.ArgumentParser(description=description)
+    defaults = cls()
+    for f in fields(cls):
         arg_name = f"--{f.name}"
         if f.type in (Path, "Path"):
             parser.add_argument(arg_name, type=Path, default=getattr(defaults, f.name))
@@ -54,4 +59,8 @@ def get_config() -> Config:
             parser.add_argument(arg_name, type=type(getattr(defaults, f.name)) if getattr(defaults, f.name) is not None else str,
                                  default=getattr(defaults, f.name))
     args = parser.parse_args()
-    return Config(**vars(args))
+    return cls(**vars(args))
+
+
+def get_config() -> Config:
+    return build_config_from_cli(Config, "Flow matching training config")

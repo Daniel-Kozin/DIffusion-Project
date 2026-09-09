@@ -24,13 +24,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from scipy.ndimage import label as cc_label
 
 from .data import load_all_volumes, rotate_label_volume, split_case_ids
 from .interpolate import interp
+from .metrics import count_components, lump_centroid_hw
 from .ode import invert, sample
 from .velocity_model import FlowMatchingUNet3D
-from .viz_utils import lump_centroid_hw, log_interpolation_step, render_single
+from .viz_utils import log_interpolation_step, render_single
 
 
 def get_device(preferred: str = "auto") -> torch.device:
@@ -41,20 +41,6 @@ def get_device(preferred: str = "auto") -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def count_components(label_volume: torch.Tensor, classes) -> int:
-    """Number of connected components (26-connectivity in 3D) of voxels whose class is in
-    `classes`. 0 if there are no such voxels at all."""
-    mask = torch.zeros_like(label_volume, dtype=torch.bool)
-    for c in classes:
-        mask |= (label_volume == c)
-    mask = mask.numpy()
-    if not mask.any():
-        return 0
-    structure = np.ones((3, 3, 3), dtype=int)  # full 26-connectivity
-    _, n = cc_label(mask, structure=structure)
-    return int(n)
 
 
 def main():
