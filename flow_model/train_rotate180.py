@@ -21,11 +21,11 @@ import torch
 import wandb
 
 from .data import build_rotation_pair_dataloaders, build_rotation_pair_datasets
-from .metrics import directional_signal_metrics, rotation_metrics
+from .metrics import rotation_metrics
 from .ode import sample
 from .rotate_config import get_rotate_config
 from .train import build_run_name, flow_matching_loss, get_device, load_checkpoint, parse_class_weights, \
-    save_checkpoint, set_seed
+    rollout_consistency_loss, save_checkpoint, set_seed
 from .velocity_model import FlowMatchingUNet3D
 from .viz_utils import log_rotation_result
 
@@ -62,14 +62,22 @@ def compute_pixel_loss_weight(config, epoch_num: int) -> float:
 
 
 def train_one_epoch_paired(model, loader, optimizer, device, class_weights=None,
-                            pixel_loss_weight: float = 0.0, dice_weight: float = 0.0, ema=None) -> float:
+                            pixel_loss_weight: float = 0.0, dice_weight: float = 0.0, ema=None,
+                            rollout_weight: float = 0.0, n_rollout_steps: int = 3,
+                            rollout_t_end: float = 0.3, rollout_every_n_batches: int = 1) -> float:
     model.train()
     total_loss = 0.0
     n = 0
-    for x0_batch, x1_batch in loader:
+    for batch_idx, (x0_batch, x1_batch) in enumerate(loader):
         optimizer.zero_grad()
         loss = flow_matching_loss(model, x1_batch, device, x0=x0_batch, class_weights=class_weights,
                                    pixel_loss_weight=pixel_loss_weight, dice_weight=dice_weight)
+        if rollout_weight > 0 and batch_idx % rollout_every_n_batches == 0:
+            r_loss = rollout_consistency_loss(model, x0_batch, x1_batch, device,
+                                               n_rollout_steps=n_rollout_steps, rollout_t_end=rollout_t_end,
+                                               class_weights=class_weights, pixel_loss_weight=pixel_loss_weight,
+                                               dice_weight=dice_weight)
+            loss = loss + rollout_weight * r_loss
         loss.backward()
         optimizer.step()
         if ema is not None:
@@ -106,19 +114,19 @@ def pick_spread_indices(val_ds, n: int):
 
 @torch.no_grad()
 def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size: int) -> dict:
-    """Aggregates rotation_metrics (decoded, discrete) and directional_signal_metrics (raw
-    velocity, pre-decode) across all `indices`, processed in chunks of `chunk_size` to bound
+    """Aggregates the trusted mask-overlap metrics (lump/pillar/combined IoU and Dice, on the
+    hard decoded labels) across all `indices`, processed in chunks of `chunk_size` to bound
     GPU memory -- a single 50-item batch through the 3D UNet's activations would be far more
     memory than the chunk_size the training batch itself was already tuned for. Returns
-    dataset-wide means/fractions, suitable for a single wandb.log call that becomes a proper
-    trend graph over epochs (unlike logging one scalar per individual pair, which is too
-    noisy pair-to-pair to read a trend off)."""
+    dataset-wide means, suitable for a single wandb.log call that becomes a proper trend graph
+    over epochs (unlike logging one scalar per individual pair, which is too noisy pair-to-pair
+    to read a trend off). Centroid distance, voxel agreement, component counts, and the raw
+    directional-signal diagnostics are deliberately not tracked here -- they were found to be
+    misleading (a diffuse/oversized blob can score well on all of them) or superseded once the
+    exposure-bias diagnosis was confirmed; mask overlap is the only metric to trust for this
+    task now."""
     model.eval()
-    voxel_agreements, centroid_errors = [], []
-    pred_components, expected_components = [], []
     lump_ious, lump_dices, pillar_ious, pillar_dices, combined_ious, combined_dices = [], [], [], [], [], []
-    cos_sims, mag_ratios = [], []
-    n_no_lump = 0
 
     for start in range(0, len(indices), chunk_size):
         chunk = indices[start:start + chunk_size]
@@ -131,13 +139,6 @@ def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size
 
         for b in range(len(chunk)):
             m = rotation_metrics(pred_labels[b], expected_labels[b])
-            voxel_agreements.append(m["voxel_agreement"])
-            if m["centroid_error_voxels"] is not None:
-                centroid_errors.append(m["centroid_error_voxels"])
-            if not m["pred_has_lump"]:
-                n_no_lump += 1
-            pred_components.append(m["pred_lump_components"])
-            expected_components.append(m["expected_lump_components"])
             if m["lump_iou"] is not None:
                 lump_ious.append(m["lump_iou"])
                 lump_dices.append(m["lump_dice"])
@@ -148,24 +149,13 @@ def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size
                 combined_ious.append(m["combined_iou"])
                 combined_dices.append(m["combined_dice"])
 
-        dsig = directional_signal_metrics(model, x0_batch, x1_batch)
-        cos_sims.append(dsig["cos_sim_mean"])
-        mag_ratios.append(dsig["magnitude_ratio_mean"])
-
     return {
-        "voxel_agreement_mean": float(np.mean(voxel_agreements)),
-        "centroid_error_voxels_mean": float(np.mean(centroid_errors)) if centroid_errors else float("nan"),
-        "frac_predicted_no_lump": n_no_lump / len(indices),
-        "pred_lump_components_mean": float(np.mean(pred_components)),
-        "expected_lump_components_mean": float(np.mean(expected_components)),
         "lump_iou_mean": float(np.mean(lump_ious)) if lump_ious else float("nan"),
         "lump_dice_mean": float(np.mean(lump_dices)) if lump_dices else float("nan"),
         "pillar_iou_mean": float(np.mean(pillar_ious)) if pillar_ious else float("nan"),
         "pillar_dice_mean": float(np.mean(pillar_dices)) if pillar_dices else float("nan"),
         "combined_iou_mean": float(np.mean(combined_ious)) if combined_ious else float("nan"),
         "combined_dice_mean": float(np.mean(combined_dices)) if combined_dices else float("nan"),
-        "cos_sim_mean": float(np.nanmean(cos_sims)),
-        "magnitude_ratio_mean": float(np.nanmean(mag_ratios)),
     }
 
 
@@ -180,6 +170,8 @@ def main():
           f"base_ch={config.base_ch}, lr={config.lr}, checkpoint_epochs={config.checkpoint_epochs}, "
           f"pixel_loss_weight={config.pixel_loss_weight}->{config.pixel_loss_weight_final}, "
           f"dice_weight={config.dice_weight}, ema_decay={config.ema_decay}")
+    print(f"      rollout_weight={config.rollout_weight}, n_rollout_steps={config.n_rollout_steps}, "
+          f"rollout_t_end={config.rollout_t_end}, rollout_every_n_batches={config.rollout_every_n_batches}")
 
     device = get_device(config.device)
     print(f"[2/5] Using device: {device}")
@@ -261,7 +253,10 @@ def main():
         pixel_loss_weight = compute_pixel_loss_weight(config, epoch_num)
         train_loss = train_one_epoch_paired(model, train_loader, optimizer, device, class_weights=class_weights,
                                              pixel_loss_weight=pixel_loss_weight, dice_weight=config.dice_weight,
-                                             ema=ema)
+                                             ema=ema, rollout_weight=config.rollout_weight,
+                                             n_rollout_steps=config.n_rollout_steps,
+                                             rollout_t_end=config.rollout_t_end,
+                                             rollout_every_n_batches=config.rollout_every_n_batches)
         val_loss = validate_paired(model, val_loader, device, class_weights=class_weights,
                                     pixel_loss_weight=pixel_loss_weight, dice_weight=config.dice_weight)
         epoch_seconds = time.time() - epoch_start
@@ -313,28 +308,16 @@ def main():
                                        n_steps=config.n_train_sample_steps, chunk_size=config.batch_size)
             wandb.log({
                 "epoch": epoch,
-                "metrics50/voxel_agreement_mean": agg["voxel_agreement_mean"],
-                "metrics50/centroid_error_voxels_mean": agg["centroid_error_voxels_mean"],
-                "metrics50/frac_predicted_no_lump": agg["frac_predicted_no_lump"],
-                "metrics50/pred_lump_components_mean": agg["pred_lump_components_mean"],
-                "metrics50/expected_lump_components_mean": agg["expected_lump_components_mean"],
                 "metrics50/lump_iou_mean": agg["lump_iou_mean"],
                 "metrics50/lump_dice_mean": agg["lump_dice_mean"],
                 "metrics50/pillar_iou_mean": agg["pillar_iou_mean"],
                 "metrics50/pillar_dice_mean": agg["pillar_dice_mean"],
                 "metrics50/combined_iou_mean": agg["combined_iou_mean"],
                 "metrics50/combined_dice_mean": agg["combined_dice_mean"],
-                "metrics50/cos_sim_mean": agg["cos_sim_mean"],
-                "metrics50/magnitude_ratio_mean": agg["magnitude_ratio_mean"],
             })
-            print(f"    [trusted] lump_IoU={agg['lump_iou_mean']:.4f}  lump_Dice={agg['lump_dice_mean']:.4f}  "
+            print(f"    lump_IoU={agg['lump_iou_mean']:.4f}  lump_Dice={agg['lump_dice_mean']:.4f}  "
                   f"pillar_IoU={agg['pillar_iou_mean']:.4f}  pillar_Dice={agg['pillar_dice_mean']:.4f}  "
                   f"combined_IoU={agg['combined_iou_mean']:.4f}  combined_Dice={agg['combined_dice_mean']:.4f}")
-            print(f"    [secondary] voxel_agreement={agg['voxel_agreement_mean']:.4f}  "
-                  f"centroid_error_voxels={agg['centroid_error_voxels_mean']:.2f}  "
-                  f"cos_sim={agg['cos_sim_mean']:.4f}  magnitude_ratio={agg['magnitude_ratio_mean']:.4f}  "
-                  f"pred_lump_components={agg['pred_lump_components_mean']:.2f} "
-                  f"(expected={agg['expected_lump_components_mean']:.2f})")
 
         if epoch_num in checkpoint_epoch_set:
             save_checkpoint(config.checkpoint_dir / f"epoch_{epoch_num:04d}.pt", model, optimizer, epoch_num, config)

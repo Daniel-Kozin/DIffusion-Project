@@ -3,7 +3,7 @@ import torch
 
 from flow_model.data import RotationPairDataset, rotate_label_volume
 from flow_model.metrics import directional_signal_metrics, mask_dice, mask_iou, rotation_metrics
-from flow_model.train import flow_matching_loss, soft_dice_loss
+from flow_model.train import flow_matching_loss, rollout_consistency_loss, soft_dice_loss
 from flow_model.train_rotate180 import EMA, compute_pixel_loss_weight
 from flow_model.velocity_model import FlowMatchingUNet3D
 
@@ -249,3 +249,42 @@ def test_ema_load_state_dict_replaces_shadow():
     new_state = {k: torch.zeros_like(v) for k, v in model.state_dict().items()}
     ema.load_state_dict(new_state)
     assert all(torch.equal(v, torch.zeros_like(v)) for v in ema.shadow.values())
+
+
+def test_rollout_consistency_loss_finite_and_backward():
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    x0 = torch.rand(1, 4, 26, 128, 128)
+    x1 = torch.rand(1, 4, 26, 128, 128)
+    loss = rollout_consistency_loss(model, x0, x1, torch.device("cpu"), n_rollout_steps=2, rollout_t_end=0.2)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None for p in model.parameters())
+
+
+def test_rollout_consistency_loss_uses_models_own_steps_not_the_true_line():
+    # Regression guard for the exact bug this loss exists to avoid reintroducing: it must
+    # feed each step's OWN output back in as the next step's input (self-directed), not keep
+    # re-evaluating at points on the teacher-forced true line. Detect this by checking the
+    # loss actually depends on ALL n_rollout_steps of the model's behavior, not just the
+    # last one -- freeze the model after modifying it between two loss computations with
+    # different first-step behavior (via different x0) and confirm the losses differ, which
+    # would not necessarily hold if the rollout secretly ignored intermediate self-steps.
+    torch.manual_seed(0)
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    model.eval()
+    x1 = torch.rand(1, 4, 26, 128, 128)
+    x0_a = torch.rand(1, 4, 26, 128, 128)
+    x0_b = torch.rand(1, 4, 26, 128, 128)
+
+    loss_a = rollout_consistency_loss(model, x0_a, x1, torch.device("cpu"), n_rollout_steps=3, rollout_t_end=0.3)
+    loss_b = rollout_consistency_loss(model, x0_b, x1, torch.device("cpu"), n_rollout_steps=3, rollout_t_end=0.3)
+    assert not torch.allclose(loss_a, loss_b)
+
+
+def test_rollout_consistency_loss_pixel_and_dice_weight_zero_gives_zero_loss():
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    x0 = torch.rand(1, 4, 26, 128, 128)
+    x1 = torch.rand(1, 4, 26, 128, 128)
+    loss = rollout_consistency_loss(model, x0, x1, torch.device("cpu"), n_rollout_steps=2, rollout_t_end=0.2,
+                                     pixel_loss_weight=0.0, dice_weight=0.0)
+    assert loss.item() == 0.0

@@ -1,13 +1,12 @@
 """
 Compares rotate180 checkpoints (e.g. the 100/250/500/1000-epoch milestones) on held-out
 validation pairs. Unlike the old interpolation task, this task has EXACT ground truth for
-every prediction (the true 180-degree-rotated phantom), so this reports real quantitative
-accuracy. The TRUSTED metrics are lump/pillar/combined mask IoU and Dice (predicted vs true
-binary mask, on the hard decoded labels) -- voxel_agreement and centroid_error_voxels are
-kept only as secondary signals, since centroid distance can look good for a diffuse or
-oversized blob whose center of mass happens to land near the true position without the
-shape actually matching. No ODE inversion is used: x0 is already real data, so evaluation is
-a single forward integration per pair.
+every prediction (the true 180-degree-rotated phantom). The only metrics tracked are
+lump/pillar/combined mask IoU and Dice (predicted vs true binary mask, on the hard decoded
+labels) -- centroid distance and voxel agreement were dropped after confirming they can look
+good for a diffuse or oversized blob whose center of mass happens to land near the true
+position without the shape actually matching. No ODE inversion is used: x0 is already real
+data, so evaluation is a single forward integration per pair.
 
     ./run_eval_rotate180.sh --checkpoints checkpoints/epoch_0100.pt checkpoints/epoch_0250.pt \
         checkpoints/epoch_0500.pt checkpoints/epoch_1000.pt
@@ -93,10 +92,7 @@ def main():
     wandb.init(project=args.wandb_project, mode=args.wandb_mode, name=run_name, config=vars(args))
 
     table = wandb.Table(columns=["checkpoint", "epoch", "lump_iou_mean", "lump_dice_mean",
-                                  "pillar_iou_mean", "pillar_dice_mean", "combined_iou_mean", "combined_dice_mean",
-                                  "voxel_agreement_mean", "centroid_error_voxels_mean",
-                                  "frac_predicted_no_lump", "pred_lump_components_mean",
-                                  "expected_lump_components_mean"])
+                                  "pillar_iou_mean", "pillar_dice_mean", "combined_iou_mean", "combined_dice_mean"])
     summary_rows = []
 
     for ckpt_path in args.checkpoints:
@@ -104,10 +100,7 @@ def main():
         ckpt_name = ckpt_path.stem
         print(f"[eval_rotate180] {ckpt_name} (epoch {epoch_trained})...")
 
-        voxel_agreements, centroid_errors = [], []
-        pred_components, expected_components = [], []
         lump_ious, lump_dices, pillar_ious, pillar_dices, combined_ious, combined_dices = [], [], [], [], [], []
-        n_no_lump = 0
 
         for idx in eval_indices:
             x0, x1 = val_ds[idx]
@@ -119,13 +112,6 @@ def main():
             orig_label = x0.argmax(dim=0)
 
             m = rotation_metrics(pred_label, expected_label)
-            voxel_agreements.append(m["voxel_agreement"])
-            if m["centroid_error_voxels"] is not None:
-                centroid_errors.append(m["centroid_error_voxels"])
-            if not m["pred_has_lump"]:
-                n_no_lump += 1
-            pred_components.append(m["pred_lump_components"])
-            expected_components.append(m["expected_lump_components"])
             if m["lump_iou"] is not None:
                 lump_ious.append(m["lump_iou"])
                 lump_dices.append(m["lump_dice"])
@@ -140,11 +126,6 @@ def main():
                 log_rotation_result(f"eval/{ckpt_name}/pair_{case_id}_o{orientation}",
                                      orig_label, pred_label, expected_label)
 
-        voxel_agreement_mean = sum(voxel_agreements) / len(voxel_agreements)
-        centroid_error_mean = sum(centroid_errors) / len(centroid_errors) if centroid_errors else float("nan")
-        frac_no_lump = n_no_lump / len(eval_indices)
-        pred_components_mean = sum(pred_components) / len(pred_components)
-        expected_components_mean = sum(expected_components) / len(expected_components)
         lump_iou_mean = sum(lump_ious) / len(lump_ious) if lump_ious else float("nan")
         lump_dice_mean = sum(lump_dices) / len(lump_dices) if lump_dices else float("nan")
         pillar_iou_mean = sum(pillar_ious) / len(pillar_ious) if pillar_ious else float("nan")
@@ -152,12 +133,9 @@ def main():
         combined_iou_mean = sum(combined_ious) / len(combined_ious) if combined_ious else float("nan")
         combined_dice_mean = sum(combined_dices) / len(combined_dices) if combined_dices else float("nan")
 
-        print(f"  [trusted] lump_IoU={lump_iou_mean:.4f}  lump_Dice={lump_dice_mean:.4f}  "
+        print(f"  lump_IoU={lump_iou_mean:.4f}  lump_Dice={lump_dice_mean:.4f}  "
               f"pillar_IoU={pillar_iou_mean:.4f}  pillar_Dice={pillar_dice_mean:.4f}  "
               f"combined_IoU={combined_iou_mean:.4f}  combined_Dice={combined_dice_mean:.4f}")
-        print(f"  [secondary] voxel_agreement={voxel_agreement_mean:.4f}  centroid_error_voxels={centroid_error_mean:.2f}  "
-              f"frac_predicted_no_lump={frac_no_lump:.3f}  pred_lump_components={pred_components_mean:.2f} "
-              f"(expected={expected_components_mean:.2f})")
 
         wandb.log({
             "checkpoint_epoch": epoch_trained,
@@ -167,15 +145,9 @@ def main():
             "eval/pillar_dice_mean": pillar_dice_mean,
             "eval/combined_iou_mean": combined_iou_mean,
             "eval/combined_dice_mean": combined_dice_mean,
-            "eval/voxel_agreement_mean": voxel_agreement_mean,
-            "eval/centroid_error_voxels_mean": centroid_error_mean,
-            "eval/frac_predicted_no_lump": frac_no_lump,
-            "eval/pred_lump_components_mean": pred_components_mean,
-            "eval/expected_lump_components_mean": expected_components_mean,
         })
         table.add_data(ckpt_name, epoch_trained, lump_iou_mean, lump_dice_mean, pillar_iou_mean, pillar_dice_mean,
-                        combined_iou_mean, combined_dice_mean, voxel_agreement_mean, centroid_error_mean,
-                        frac_no_lump, pred_components_mean, expected_components_mean)
+                        combined_iou_mean, combined_dice_mean)
         summary_rows.append((ckpt_name, epoch_trained, combined_dice_mean))
 
     wandb.log({"eval/summary_table": table})

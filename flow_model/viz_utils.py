@@ -35,12 +35,21 @@ def render_label_volumes(label_volumes: List[torch.Tensor], names: Optional[List
 
     with open(_RENDER_LOCK_PATH, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        vis = None
         try:
             vis = visualize_inserts_3d(off_screen=True, show_text=False, look_up=look_up)
             for vol, name in zip(label_volumes, names):
                 vis.load_array(vol, name=name)
             imgs = vis.show()
         finally:
+            # render_all()'s off-screen path never closes the VTK render window/GL context
+            # it opens (only the interactive quit_program() path does) -- every render call
+            # through here leaked one. Over hours of periodic previews across multiple
+            # concurrent training jobs this accumulates fast and degrades/corrupts
+            # subsequent renders. Close explicitly, inside the lock, so a leaked context
+            # can never be attributed to "two processes rendering at once" confusion again.
+            if vis is not None:
+                vis.plotter.close()
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     return imgs if imgs is not None else []
@@ -262,8 +271,8 @@ def rotation_result_figure(render_orig: np.ndarray, render_pred: np.ndarray, ren
 
     pos_*: (w, h) lump centroid from lump_centroid_hw(), or None if that volume has no lump
     voxels (falls back to the volume center, annotated as such).
-    metrics: optional dict from metrics.rotation_metrics() -- when given, voxel agreement and
-    centroid error are annotated as a text box on the left panel.
+    metrics: optional dict from metrics.rotation_metrics() -- when given, lump IoU/Dice (the
+    trusted metrics for this task) are annotated as a text box on the left panel.
     """
     H, W = volume_hw
     fallback = (W / 2, H / 2)
@@ -303,10 +312,12 @@ def rotation_result_figure(render_orig: np.ndarray, render_pred: np.ndarray, ren
 
     ax_left.legend(loc="upper right", fontsize=8, framealpha=0.9)
     if metrics is not None:
-        agreement = metrics.get("voxel_agreement")
-        centroid_err = metrics.get("centroid_error_voxels")
-        text = f"voxel agreement: {agreement:.1%}" if agreement is not None else "voxel agreement: n/a"
-        text += "\ncentroid error: " + (f"{centroid_err:.1f} vox" if centroid_err is not None else "n/a")
+        lump_iou = metrics.get("lump_iou")
+        lump_dice = metrics.get("lump_dice")
+        combined_dice = metrics.get("combined_dice")
+        text = f"lump IoU: {lump_iou:.3f}" if lump_iou is not None else "lump IoU: n/a"
+        text += "\nlump Dice: " + (f"{lump_dice:.3f}" if lump_dice is not None else "n/a")
+        text += "\ncombined Dice: " + (f"{combined_dice:.3f}" if combined_dice is not None else "n/a")
         ax_left.text(0.02, 0.02, text, transform=ax_left.transAxes, fontsize=9, va="bottom", ha="left",
                      bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="gray"))
     ax_left.set_xlim(0, W)

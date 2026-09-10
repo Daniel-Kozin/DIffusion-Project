@@ -136,6 +136,62 @@ def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torc
     return loss
 
 
+def rollout_consistency_loss(model: FlowMatchingUNet3D, x0: torch.Tensor, x1: torch.Tensor,
+                              device: torch.device, n_rollout_steps: int = 3, rollout_t_end: float = 0.3,
+                              class_weights: Optional[torch.Tensor] = None,
+                              pixel_loss_weight: float = 1.0, dice_weight: float = 1.0,
+                              dice_classes: tuple = (2, 3)) -> torch.Tensor:
+    """
+    Trains on the model's OWN short self-directed rollout from x0, instead of only ever
+    evaluating at exact points on the teacher-forced line between x0 and x1 (what
+    flow_matching_loss does). Directly targets exposure bias: a model can fit the
+    line-only objective very well -- correct velocity direction (cos_sim ~0.95) and
+    roughly correct magnitude on the true line -- while still being inaccurate once its
+    actual generated trajectory departs from that line, which is exactly what full training
+    runs showed: velocity diagnostics measured on the true line looked good, but the actual
+    decoded multi-step rollout only reached ~0.07-0.15 lump-mask IoU. Confirmed this is NOT a
+    numerical integration artifact (switching the sampler to Heun's method, or using 3x more
+    steps, made no measurable difference) -- the learned field itself is inaccurate once
+    queried off the narrow training distribution, because training never showed it any state
+    reached by its own imperfect steps.
+
+    Rolls out n_rollout_steps real Euler steps (WITH gradients, unlike ode.sample which is
+    @torch.no_grad) from x0 at t=0 to t=rollout_t_end, feeding each step's own output back in
+    as the next step's input -- exactly what happens at inference, except here the loss can
+    push back on it. At the rolled-out endpoint, reuses the same one-step x1-estimate trick
+    as flow_matching_loss (x1_hat = x + (1 - t_end) * v_last, using the last step's velocity)
+    and applies the same cross-entropy + Dice terms against the true x1. Keep
+    n_rollout_steps/rollout_t_end small -- this costs n_rollout_steps forward+backward passes
+    per call versus flow_matching_loss's one, and the full computation graph across all steps
+    must stay live for backprop.
+    """
+    x0 = x0.to(device)
+    x1 = x1.to(device)
+    B = x0.shape[0]
+    dt = rollout_t_end / n_rollout_steps
+
+    x = x0
+    v = None
+    for i in range(n_rollout_steps):
+        t = torch.full((B,), i * dt, device=device)
+        v = model(x, t)
+        x = x + v * dt
+
+    x1_hat = x + (1 - rollout_t_end) * v
+    target_classes = x1.argmax(dim=1)
+
+    loss = torch.zeros((), device=device)
+    if pixel_loss_weight > 0:
+        ce_weight = class_weights.flatten() if class_weights is not None else None
+        ce = F.cross_entropy(x1_hat, target_classes, weight=ce_weight)
+        loss = loss + pixel_loss_weight * ce
+    if dice_weight > 0:
+        probs = F.softmax(x1_hat, dim=1)
+        dice = soft_dice_loss(probs, target_classes, dice_classes)
+        loss = loss + dice_weight * dice
+    return loss
+
+
 def train_one_epoch(model, loader, optimizer, device, class_weights=None) -> float:
     model.train()
     total_loss = 0.0

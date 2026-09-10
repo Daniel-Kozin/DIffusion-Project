@@ -44,6 +44,22 @@ class RotateConfig:
     # from one 25-epoch checkpoint to the next in the first full run, without a clear trend.
     # 0.999 gives roughly a ~10-epoch smoothing window at this task's ~100 steps/epoch.
     ema_decay: float = 0.999
+    # Weight on rollout_consistency_loss (see train.py's docstring) -- trains on a few real,
+    # gradient-tracked ODE steps from x0 using the model's OWN predictions, instead of only
+    # ever evaluating at exact points on the teacher-forced line between x0 and x1. Added
+    # after confirming the exposure-bias gap directly: switching the sampler to Heun's method
+    # or tripling the step count made no measurable difference to eval-time lump-mask IoU
+    # (~0.09-0.10 either way), ruling out numerical integration error -- the learned field is
+    # simply inaccurate once queried on states its own imperfect steps actually reach, which
+    # this loss is the only one of this task's fixes so far to train on directly. 0.0 disables
+    # it entirely (paired losses above still apply on their own).
+    rollout_weight: float = 1.0
+    n_rollout_steps: int = 3
+    rollout_t_end: float = 0.3
+    # Apply the rollout loss only every Nth training batch -- it costs n_rollout_steps extra
+    # forward+backward passes (with the full computation graph kept live across them) versus
+    # flow_matching_loss's one, so applying it every batch would meaningfully slow training.
+    rollout_every_n_batches: int = 2
     base_ch: int = 8
     embed_channels: int = 16
     dropout: float = 0.1

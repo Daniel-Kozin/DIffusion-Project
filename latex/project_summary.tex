@@ -7,6 +7,7 @@
 \usetikzlibrary{arrows.meta, positioning}
 \usepackage{enumitem}
 \usepackage{parskip}
+\usepackage{booktabs}
 \usepackage[colorlinks=true, linkcolor=blue!50!black, citecolor=blue!50!black]{hyperref}
 
 \definecolor{hdrblue}{RGB}{26,61,109}
@@ -684,6 +685,246 @@ becomes meaningful. Likely necessary but not sufficient on its own.
   space (Section~7).
 \item Documented four candidate next directions, from a zero-retraining experiment to
   training-data and architecture changes (Section~9).
+\end{itemize}
+
+\newpage
+\hsec{Part II: pivoting away from interpolation --- the 180-degree rotation task}
+
+Section~9's four candidate fixes all assume the underlying interpolation idea is sound and
+just needs a smoother latent space, a denser training signal, or a more forgiving target. The
+next work session took a different approach entirely: rather than continuing to chase the
+$A\!\to\!B$ interpolation problem, pivot to a self-supervised task with the one property the
+interpolation task fundamentally lacked --- \emph{exact ground truth} for every prediction,
+so progress could finally be measured against a known-correct answer instead of only judged
+by eye.
+
+\hsub{10. The new task: learn to rotate a phantom 180 degrees}
+Every phantom in the dataset is augmented with $8\times$ in-plane rotation at $45^\circ$
+increments (orientation $o \in \{0,\dots,7\}$, Section~1). Because $180^\circ = 4\times45^\circ$,
+orientation $o$ and orientation $(o+4)\bmod 8$ of the \emph{same} underlying phantom are an
+exact, bit-for-bit $180^\circ$ pair --- confirmed lossless, since \texttt{torchvision}'s
+nearest-neighbor rotation at exactly $180^\circ$ reduces to a pure array flip with no
+interpolation artifacts. This gives a new task with a property interpolation never had: pick
+any phantom at any orientation as $x_0$, and its exact target $x_1$ is known in closed form,
+with no scan, no heuristic, and no synthetic blending needed.
+\begin{equation}
+x_0 = \text{rotate}(x_{\text{raw}}, o), \qquad x_1 = \text{rotate}(x_{\text{raw}}, (o+4)\bmod 8).
+\label{eq:rotate180-pair}
+\end{equation}
+Splitting phantoms by whether the lump sits right or left of the volume's vertical center
+line ($w \gtrless 63.5$, ``set A'' vs ``set B'') confirmed the framing geometrically: across
+all 984 augmented instances, the split came out exactly balanced (492/492) with zero
+ambiguous cases, and by construction every $(o, o{+}4)$ pair lands on opposite sides --- so
+training bidirectionally on all 8 orientations as $x_0$ automatically covers both
+$A\!\to\!B$ and $B\!\to\!A$ without any explicit filtering.
+
+Because $x_0$ is now always real data (never Gaussian noise), generation no longer needs the
+inversion step at all: sampling is a single forward integration of
+Eq.~\eqref{eq:euler-fwd} starting from the real $x_0$. This sidesteps the entire
+interpolation failure mode from Part I by construction --- there is no noise-space midpoint
+to be inaccurate about.
+
+\hsub{11. First result: loss goes down, nothing moves}
+Training with the unmodified loss from Eq.~\eqref{eq:loss} (now with $x_0$ real instead of
+noise) produced a striking failure: \texttt{train/val\_loss} dropped substantially over
+hundreds of epochs, yet the \emph{decoded} prediction was --- voxel for voxel, checked
+programmatically, not just by eye --- \textbf{100\% identical to $x_0$} on every one of 10
+tested validation pairs, unaffected by using up to $20\times$ more ODE integration steps at
+inference. The resolution came from separating two different questions: is the raw,
+continuous velocity prediction directionally correct (measured \emph{on} the exact training
+line, i.e. with an oracle view of $x_1$), versus does the actual multi-step, self-directed
+generation process reach the target. A broader check (20 validation pairs, several $t$ values,
+$t=0.5$ excluded as the one point where the one-hot blend is maximally ambiguous regardless of
+training quality) showed the network already had a strong, consistent \emph{directional}
+signal ($\cos\text{-sim}\approx 0.65$) at that point in training --- the problem was pure
+\emph{magnitude}: predicted velocity was only $\sim$20\% of the size needed to actually flip a
+voxel's class after integration, a classic symptom of plain MSE regression hedging toward an
+undercommitted answer once loss is already fairly low.
+
+\hsub{12. Fix 1: a cross-entropy term on the endpoint estimate}
+Since $v^* = x_1-x_0$ is constant along the line, algebra gives an ``endpoint estimate'' from
+any point on the trajectory using only quantities already computed in the forward pass:
+\begin{equation}
+\hat x_1 \;=\; x_t + (1-t)\,v_\theta(x_t,t), \label{eq:endpoint-estimate}
+\end{equation}
+exact when $v_\theta = v^*$. A first attempt supervised this with an \emph{MSE} loss against
+the true $x_1$ --- but algebraically, $(\hat x_1 - x_1)^2 = (1-t)^2(v_\theta - v^*)^2$: exactly
+$(1-t)^2$ times the existing velocity loss, same minimizer, same gradient direction, not a new
+training signal at all (caught before wasting a training run on it). The actual fix uses
+\textbf{cross-entropy} instead:
+\begin{equation}
+\mathcal{L}_{\text{pixel}} = \text{CE}\big(\hat x_1,\, \text{argmax}(x_1)\big), \qquad
+\mathcal{L} = \mathcal{L}_{\text{velocity}} + \lambda_{\text{pixel}}\,\mathcal{L}_{\text{pixel}}.
+\label{eq:pixel-loss}
+\end{equation}
+Unlike MSE, cross-entropy's gradient does \emph{not} shrink as a prediction approaches
+``good enough'' -- it stays large as long as the wrong class is still winning at a voxel,
+directly countering the undercommitment found in Section~11. This worked: the decoded
+prediction started moving for the first time, with real, substantial repositioning (roughly a
+50--60\% reduction in lump-centroid distance versus doing nothing) within the first $\sim$150
+epochs of a fresh 1000-epoch run.
+
+\hsub{13. The centroid metric lies: a new failure mode}
+Direct visual inspection of the trained predictions (not just their summary statistics) told
+a different story than the centroid-distance numbers: predictions were a \textbf{massive,
+fragmented crescent-shaped blob} covering much of the volume's cross-section, not a small
+relocated lump --- confirmed quantitatively as \textbf{$\sim$24 disconnected predicted lump
+components versus $\sim$1 expected} on real phantoms. Centroid distance and overall
+voxel-agreement both stayed misleadingly reasonable throughout, because a large blob's center
+of mass can coincidentally land near the true position, and because background voxels
+dominate voxel-agreement regardless. The root cause is a specific property of PyTorch's
+class-weighted cross-entropy: the \texttt{weight} argument scales the loss by each voxel's
+\emph{true} class, not its predicted one, so missing a real lump voxel costs up to
+$12.57\times$ but wrongly predicting lump at a true-background voxel costs only $1.0\times$
+--- a direct, asymmetric incentive to over-predict the rare classes wherever the network is
+unsure.
+
+\hsub{14. Fix 2: symmetric volume regularization, a decaying schedule, and EMA}
+Three complementary changes addressed this:
+\begin{itemize}[nosep]
+\item \textbf{Soft Dice loss} on the lump/pillar channels, added alongside
+  Eq.~\eqref{eq:pixel-loss}:
+  \begin{equation}
+  \mathcal{L}_{\text{dice}} = 1 - \frac{2\sum_v p_v t_v + 1}{\sum_v p_v + \sum_v t_v + 1},
+  \qquad \mathcal{L} \mathrel{+}= \lambda_{\text{dice}}\,\mathcal{L}_{\text{dice}}.
+  \label{eq:dice}
+  \end{equation}
+  Unlike cross-entropy, Dice is symmetric in false positives and false negatives --- predicting
+  excess volume directly grows the denominator without growing the overlap numerator, so
+  over-prediction is penalized even where CE does not penalize it.
+\item \textbf{Decaying $\lambda_{\text{pixel}}$}: linearly interpolated from $1.0$ down to
+  $0.3$ over training (by absolute epoch, so it continues correctly across a resumed run) ---
+  cross-entropy's magnitude push has no natural ceiling and was found to sustain a
+  $\sim$1.25--1.3$\times$ magnitude overshoot for hundreds of epochs when held constant; fading
+  it out lets the bounded, well-behaved velocity MSE and Dice terms dominate refinement later.
+\item \textbf{EMA of the model weights} (decay $0.999$, $\sim$10-epoch smoothing window at
+  this task's step rate), used for every preview, diagnostic, and checkpoint save instead of
+  the raw training weights --- motivated directly by the aggregate lump-centroid-error metric
+  swinging between $\sim$17 and $\sim$60 voxels from one 25-epoch checkpoint to the next with
+  no clear trend, a classic symptom of noisy per-step weights in diffusion/flow-matching
+  training.
+\end{itemize}
+This combination fixed the blob: predicted lump component counts fell from the 20--60 range
+to mostly 2--14, much closer to the $\sim$1 expected.
+
+\hsub{15. A properly trusted metric: mask overlap, not centroid distance}
+Even after fix~14, a closer look showed the improvement was still partly illusory. Directly
+computing lump-mask \textbf{IoU} and \textbf{Dice} (intersection-over-union and Dice
+coefficient between the predicted and true \emph{binary} lump mask, not just their centroids)
+gave a mean IoU of only $\approx 0.07$ and Dice $\approx 0.13$ across ten validation pairs ---
+versus an exact $0.000$ for a trivial ``never move anything'' baseline (meaningful, since the
+two positions are always $180^\circ$ apart and can never overlap by chance), but far from
+good. Table~\ref{tab:iou-example} makes the point concretely: a $5\times5$ predicted blob
+containing one true voxel scores IoU $= 1/25 = 0.04$ while its centroid can be dead-on. Mask
+IoU/Dice (per class and combined lump+pillar) is now the trusted metric throughout the
+codebase; centroid distance is kept only as a secondary, easily-misled signal.
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Scenario & Centroid error & IoU & Dice \\
+\midrule
+Never move (trivial baseline) & large & 0.00 & 0.00 \\
+Small blob near true position, poor shape & can look small & 0.04--0.10 & 0.08--0.18 \\
+Correct, precisely-shaped prediction & $\approx 0$ & $\to 1.0$ & $\to 1.0$ \\
+\bottomrule
+\end{tabular}
+\caption{Why mask overlap and centroid distance can disagree sharply on the same prediction.}
+\label{tab:iou-example}
+\end{table}
+
+\hsub{16. Ruling out numerical error: it's exposure bias, not integration accuracy}
+Before touching the loss again, the live checkpoint was tested for a simpler possible cause:
+insufficient integration accuracy. Switching the sampler from Euler to Heun's method
+(second-order predictor--corrector, already implemented) and separately tripling the step
+count ($30\!\to\!100$) both left mean combined IoU essentially unchanged
+($0.094 \to 0.094 \to 0.090$). This rules out numerical discretization error and points
+squarely at \emph{exposure bias}: the network was only ever trained at points exactly on the
+straight line between a real $(x_0,x_1)$ pair (Eq.~\eqref{eq:path}), so it can fit that
+narrow, teacher-forced objective well --- correct direction, roughly correct magnitude ---
+while still being inaccurate the moment its own multi-step, self-directed trajectory departs
+from that line, which it does almost immediately (measured drift from the true line grows
+roughly linearly step over step, reaching a magnitude comparable to the pair's own
+$x_0$-to-$x_1$ distance well before the trajectory completes).
+
+\hsub{17. Fix 3: training on the model's own rollout, not just the teacher-forced line}
+The direct fix is to expose the network, during training, to states reached by \emph{its own}
+imperfect steps, not only the idealized line. A short, gradient-tracked rollout from $x_0$
+using the model's own predictions at each step,
+\begin{equation}
+x^{(0)} = x_0, \qquad x^{(i+1)} = x^{(i)} + v_\theta\big(x^{(i)}, i\,\Delta t\big)\,\Delta t,
+\quad i = 0,\dots,k-1, \quad \Delta t = t_{\text{end}}/k, \label{eq:rollout}
+\end{equation}
+followed by the same endpoint-estimate trick (Eq.~\eqref{eq:endpoint-estimate}) and the same
+cross-entropy + Dice terms (Eqs.~\ref{eq:pixel-loss}, \ref{eq:dice}) evaluated at the rolled-out
+state instead of a point on the true line, directly penalizes drift instead of only ever
+rewarding accuracy on a path the network will never exactly follow at inference. Unlike
+Eq.~\eqref{eq:path}, every step of Eq.~\eqref{eq:rollout} feeds forward through the network with
+gradients retained, so this costs $k$ forward/backward passes per training step instead of one
+and needs the full computation graph kept live across all $k$ steps.
+
+This loss proved unstable when applied to a freshly-initialized network: with $k{=}3$,
+$t_{\text{end}}{=}0.3$, applied every other batch, predicted lump components on a from-scratch
+run \emph{grew} across the first three epochs ($754 \to 1794 \to 13370$) rather than settling
+down --- plausibly because compounding a still-near-random field across $k$ real self-steps
+early in training produces wildly out-of-distribution states, and the resulting large,
+noisy gradients destabilize the network before it has any baseline competence to build on.
+Applying the identical loss as a \emph{continuation} of an already-trained checkpoint (resumed
+from epoch 469 of the fix-14 run) showed no such instability --- component counts stayed low
+and stable across five additional epochs. An extended run applying this as a fine-tuning phase
+on top of the fix-14 checkpoint was launched to test whether mask IoU/Dice actually trends
+upward over a longer horizon; results were not yet available at the time of writing.
+
+\hsub{18. Supporting infrastructure built alongside the modeling work}
+\begin{itemize}[nosep]
+\item \texttt{RotationPairDataset}: bidirectional $(x_0,x_1)$ pairing via
+  Eq.~\eqref{eq:rotate180-pair} for both train and validation splits (orientation is the task
+  variable here, not an augmentation nuisance to be dropped from validation).
+\item Checkpoint resume support (\texttt{--resume\_from}, plus reattaching to the same wandb
+  run id) added specifically so a promising run could be extended rather than restarted from
+  scratch --- used repeatedly once the rollout-loss fine-tuning strategy above was adopted.
+\item DataLoader \texttt{num\_workers} support: the paired dataset's \texttt{\_\_getitem\_\_}
+  does two rotations per item (versus the unconditional task's free noise draw), which was
+  starving the GPU at \texttt{num\_workers=0}; parallelizing gave a measured $3.4\times$
+  speedup (127s/epoch~$\to$~37s/epoch) with identical loss values, confirming it was a pure
+  I/O fix.
+\item A 50-pair aggregate diagnostic pass, run periodically during training and logged as a
+  proper trend graph, replacing an earlier design that logged one scalar per individual
+  preview pair (too noisy pair-to-pair to read a trend off).
+\item \texttt{eval\_rotate180.py}: compares any set of checkpoints (e.g. the 100/250/500/1000
+  epoch milestones) on the full held-out validation set with exact ground truth, auto-detecting
+  each checkpoint's architecture from its own saved config rather than requiring hand-matched
+  CLI flags.
+\end{itemize}
+
+\hsec{Summary of concrete changes made this session (Part II)}
+\begin{itemize}[nosep]
+\item Pivoted from noise-space interpolation to a self-supervised $180^\circ$-rotation task
+  with exact, closed-form ground truth for every prediction (Section~10).
+\item Built and verified the set A/B lump-position split (492/492 balanced, 0 ambiguous) and a
+  showcase figure.
+\item Diagnosed, by checking the decoded output directly rather than trusting the loss curve,
+  that plain velocity MSE never moved the prediction at all; traced this to an undercommitted
+  velocity magnitude, not a directional error (Section~11).
+\item Added and then \emph{rejected} a redundant MSE-based pixel loss after catching, by
+  algebra, that it was an exact reweighting of the existing velocity loss; replaced it with a
+  genuinely new cross-entropy signal (Section~12).
+\item Found, via direct visual inspection, that the cross-entropy fix produced a massive
+  fragmented blob ($\sim$24 components vs $\sim$1 expected) that the centroid/voxel-agreement
+  metrics had been hiding; traced this to cross-entropy's asymmetric true-class-only weighting
+  (Section~13).
+\item Added Dice loss, a decaying pixel-loss schedule, and EMA weights to fix the blob and
+  stabilize training (Section~14).
+\item Added mask IoU/Dice (lump, pillar, combined) as the trusted evaluation metric,
+  demonstrating concretely why centroid distance is not sufficient on its own (Section~15).
+\item Ruled out numerical integration error as the remaining bottleneck (Heun's method and
+  $3\times$ more steps: no change) and confirmed exposure bias as the root cause (Section~16).
+\item Implemented a gradient-tracked rollout-consistency loss that trains directly on the
+  model's own multi-step behavior; found it unstable from a fresh initialization but stable as
+  a fine-tuning phase on an already-trained checkpoint, and launched an extended run to
+  evaluate it (Section~17).
+\item Built checkpoint-resume infrastructure, a $3.4\times$ DataLoader speedup, an aggregate
+  diagnostic pass, and a cross-checkpoint evaluation script (Section~18).
 \end{itemize}
 
 \end{document}
