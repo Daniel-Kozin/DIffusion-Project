@@ -116,6 +116,7 @@ def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size
     model.eval()
     voxel_agreements, centroid_errors = [], []
     pred_components, expected_components = [], []
+    lump_ious, lump_dices, pillar_ious, pillar_dices, combined_ious, combined_dices = [], [], [], [], [], []
     cos_sims, mag_ratios = [], []
     n_no_lump = 0
 
@@ -137,6 +138,15 @@ def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size
                 n_no_lump += 1
             pred_components.append(m["pred_lump_components"])
             expected_components.append(m["expected_lump_components"])
+            if m["lump_iou"] is not None:
+                lump_ious.append(m["lump_iou"])
+                lump_dices.append(m["lump_dice"])
+            if m["pillar_iou"] is not None:
+                pillar_ious.append(m["pillar_iou"])
+                pillar_dices.append(m["pillar_dice"])
+            if m["combined_iou"] is not None:
+                combined_ious.append(m["combined_iou"])
+                combined_dices.append(m["combined_dice"])
 
         dsig = directional_signal_metrics(model, x0_batch, x1_batch)
         cos_sims.append(dsig["cos_sim_mean"])
@@ -148,6 +158,12 @@ def run_diagnostic_pass(model, val_ds, indices, device, n_steps: int, chunk_size
         "frac_predicted_no_lump": n_no_lump / len(indices),
         "pred_lump_components_mean": float(np.mean(pred_components)),
         "expected_lump_components_mean": float(np.mean(expected_components)),
+        "lump_iou_mean": float(np.mean(lump_ious)) if lump_ious else float("nan"),
+        "lump_dice_mean": float(np.mean(lump_dices)) if lump_dices else float("nan"),
+        "pillar_iou_mean": float(np.mean(pillar_ious)) if pillar_ious else float("nan"),
+        "pillar_dice_mean": float(np.mean(pillar_dices)) if pillar_dices else float("nan"),
+        "combined_iou_mean": float(np.mean(combined_ious)) if combined_ious else float("nan"),
+        "combined_dice_mean": float(np.mean(combined_dices)) if combined_dices else float("nan"),
         "cos_sim_mean": float(np.nanmean(cos_sims)),
         "magnitude_ratio_mean": float(np.nanmean(mag_ratios)),
     }
@@ -302,10 +318,19 @@ def main():
                 "metrics50/frac_predicted_no_lump": agg["frac_predicted_no_lump"],
                 "metrics50/pred_lump_components_mean": agg["pred_lump_components_mean"],
                 "metrics50/expected_lump_components_mean": agg["expected_lump_components_mean"],
+                "metrics50/lump_iou_mean": agg["lump_iou_mean"],
+                "metrics50/lump_dice_mean": agg["lump_dice_mean"],
+                "metrics50/pillar_iou_mean": agg["pillar_iou_mean"],
+                "metrics50/pillar_dice_mean": agg["pillar_dice_mean"],
+                "metrics50/combined_iou_mean": agg["combined_iou_mean"],
+                "metrics50/combined_dice_mean": agg["combined_dice_mean"],
                 "metrics50/cos_sim_mean": agg["cos_sim_mean"],
                 "metrics50/magnitude_ratio_mean": agg["magnitude_ratio_mean"],
             })
-            print(f"    voxel_agreement={agg['voxel_agreement_mean']:.4f}  "
+            print(f"    [trusted] lump_IoU={agg['lump_iou_mean']:.4f}  lump_Dice={agg['lump_dice_mean']:.4f}  "
+                  f"pillar_IoU={agg['pillar_iou_mean']:.4f}  pillar_Dice={agg['pillar_dice_mean']:.4f}  "
+                  f"combined_IoU={agg['combined_iou_mean']:.4f}  combined_Dice={agg['combined_dice_mean']:.4f}")
+            print(f"    [secondary] voxel_agreement={agg['voxel_agreement_mean']:.4f}  "
                   f"centroid_error_voxels={agg['centroid_error_voxels_mean']:.2f}  "
                   f"cos_sim={agg['cos_sim_mean']:.4f}  magnitude_ratio={agg['magnitude_ratio_mean']:.4f}  "
                   f"pred_lump_components={agg['pred_lump_components_mean']:.2f} "

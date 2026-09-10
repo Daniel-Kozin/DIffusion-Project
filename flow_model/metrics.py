@@ -49,11 +49,57 @@ def voxel_class_agreement(pred_label: torch.Tensor, target_label: torch.Tensor) 
     return (pred_label == target_label).float().mean().item()
 
 
+def mask_iou(pred_label: torch.Tensor, target_label: torch.Tensor, classes) -> Optional[float]:
+    """
+    Intersection-over-union of the two label volumes' binary masks for `classes` (an int for
+    a single class, or an iterable to treat several classes as one combined foreground mask).
+    Unlike centroid distance, this catches a diffuse/oversized blob whose center of mass
+    happens to land near the true lump but whose actual shape/extent doesn't match: a blob
+    covering 10x the true lump's volume can have a near-perfect centroid while IoU stays low,
+    since the union grows a lot faster than the intersection. None if neither mask has voxels.
+    This is the metric to trust over centroid_error_voxels for judging real progress on this
+    task -- see the lump-vs-pillar-vs-combined mask discussion.
+    """
+    classes = (classes,) if isinstance(classes, int) else tuple(classes)
+    pred_mask = torch.zeros_like(pred_label, dtype=torch.bool)
+    true_mask = torch.zeros_like(target_label, dtype=torch.bool)
+    for c in classes:
+        pred_mask |= (pred_label == c)
+        true_mask |= (target_label == c)
+    union = (pred_mask | true_mask).sum().item()
+    if union == 0:
+        return None
+    intersection = (pred_mask & true_mask).sum().item()
+    return intersection / union
+
+
+def mask_dice(pred_label: torch.Tensor, target_label: torch.Tensor, classes) -> Optional[float]:
+    """Dice coefficient (2*|intersection| / (|pred|+|true|)) of the two label volumes' binary
+    masks for `classes` (int or iterable, see mask_iou) -- the same quantity soft_dice_loss
+    optimizes during training, reported here as a hard (discrete) evaluation metric. None if
+    neither mask has any voxels."""
+    classes = (classes,) if isinstance(classes, int) else tuple(classes)
+    pred_mask = torch.zeros_like(pred_label, dtype=torch.bool)
+    true_mask = torch.zeros_like(target_label, dtype=torch.bool)
+    for c in classes:
+        pred_mask |= (pred_label == c)
+        true_mask |= (target_label == c)
+    denom = pred_mask.sum().item() + true_mask.sum().item()
+    if denom == 0:
+        return None
+    intersection = (pred_mask & true_mask).sum().item()
+    return 2 * intersection / denom
+
+
 def rotation_metrics(pred_label: torch.Tensor, expected_label: torch.Tensor,
-                      lump_class: int = 3) -> Dict[str, Optional[float]]:
+                      lump_class: int = 3, pillar_class: int = 2) -> Dict[str, Optional[float]]:
     """Single source of truth for the quantitative comparison used by both
     train_rotate180.py's periodic preview and eval_rotate180.py's checkpoint comparison, so
-    the two can't drift apart."""
+    the two can't drift apart. lump_iou/lump_dice/pillar_iou/pillar_dice/combined_iou/
+    combined_dice (mask overlap on hard, decoded labels) are the trusted metrics for this
+    task; centroid_error_voxels is kept only as a secondary signal -- it can look good for a
+    diffuse, oversized, or poorly-shaped blob whose center of mass happens to land near the
+    true position, which is exactly the failure mode mask overlap is meant to catch."""
     pos_pred = lump_centroid_hw(pred_label, lump_class)
     pos_expected = lump_centroid_hw(expected_label, lump_class)
     return {
@@ -62,6 +108,12 @@ def rotation_metrics(pred_label: torch.Tensor, expected_label: torch.Tensor,
         "pred_has_lump": pos_pred is not None,
         "pred_lump_components": count_components(pred_label, classes=(lump_class,)),
         "expected_lump_components": count_components(expected_label, classes=(lump_class,)),
+        "lump_iou": mask_iou(pred_label, expected_label, lump_class),
+        "lump_dice": mask_dice(pred_label, expected_label, lump_class),
+        "pillar_iou": mask_iou(pred_label, expected_label, pillar_class),
+        "pillar_dice": mask_dice(pred_label, expected_label, pillar_class),
+        "combined_iou": mask_iou(pred_label, expected_label, (lump_class, pillar_class)),
+        "combined_dice": mask_dice(pred_label, expected_label, (lump_class, pillar_class)),
     }
 
 

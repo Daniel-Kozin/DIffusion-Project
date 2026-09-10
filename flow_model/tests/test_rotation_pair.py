@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from flow_model.data import RotationPairDataset, rotate_label_volume
-from flow_model.metrics import directional_signal_metrics, rotation_metrics
+from flow_model.metrics import directional_signal_metrics, mask_dice, mask_iou, rotation_metrics
 from flow_model.train import flow_matching_loss, soft_dice_loss
 from flow_model.train_rotate180 import EMA, compute_pixel_loss_weight
 from flow_model.velocity_model import FlowMatchingUNet3D
@@ -47,6 +47,53 @@ def test_rotation_metrics_on_synthetic_shift():
     assert m["pred_lump_components"] == 1
     assert m["expected_lump_components"] == 1
     assert 0.0 <= m["voxel_agreement"] <= 1.0
+    # disjoint single-voxel masks -> IoU/Dice both 0 (no overlap)
+    assert m["lump_iou"] == 0.0
+    assert m["lump_dice"] == 0.0
+
+
+def test_mask_iou_and_dice_perfect_and_zero_overlap():
+    a = torch.zeros(2, 4, 4, dtype=torch.long)
+    a[0, 1, 1] = 3
+    a[0, 2, 2] = 3
+    b_perfect = a.clone()
+    b_disjoint = torch.zeros(2, 4, 4, dtype=torch.long)
+    b_disjoint[1, 3, 3] = 3
+
+    assert mask_iou(a, b_perfect, 3) == 1.0
+    assert mask_dice(a, b_perfect, 3) == 1.0
+    assert mask_iou(a, b_disjoint, 3) == 0.0
+    assert mask_dice(a, b_disjoint, 3) == 0.0
+    assert mask_iou(torch.zeros_like(a), torch.zeros_like(a), 3) is None
+
+
+def test_mask_iou_penalizes_oversized_blob_more_than_centroid_would():
+    # true: a single lump voxel. predicted: covers it plus a much larger surrounding blob --
+    # the "huge blob near the right spot" failure this metric is meant to catch. Centroid
+    # distance could look fine here (the blob's center can be near the true voxel) while IoU
+    # stays low, since the union grows much faster than the intersection.
+    true_label = torch.zeros(1, 8, 8, dtype=torch.long)
+    true_label[0, 4, 4] = 3
+    pred_label = torch.zeros(1, 8, 8, dtype=torch.long)
+    pred_label[0, 2:7, 2:7] = 3  # 25-voxel blob containing the true voxel
+
+    iou = mask_iou(pred_label, true_label, 3)
+    assert iou is not None and iou < 0.1  # 1 / 25 = 0.04
+
+
+def test_mask_iou_combined_classes():
+    pred = torch.zeros(1, 4, 4, dtype=torch.long)
+    true = torch.zeros(1, 4, 4, dtype=torch.long)
+    pred[0, 0, 0] = 2  # pillar, correct
+    pred[0, 1, 1] = 3  # lump, correct
+    true[0, 0, 0] = 2
+    true[0, 1, 1] = 3
+
+    assert mask_iou(pred, true, (2, 3)) == 1.0
+    assert mask_dice(pred, true, (2, 3)) == 1.0
+    # single-class views still see only their own class
+    assert mask_iou(pred, true, 2) == 1.0
+    assert mask_iou(pred, true, 3) == 1.0
 
 
 def test_flow_matching_loss_with_real_x0_backward():
