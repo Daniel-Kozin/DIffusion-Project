@@ -43,9 +43,31 @@ def parse_class_weights(class_weights: str, device: torch.device) -> torch.Tenso
     return weights.view(1, -1, 1, 1, 1)
 
 
+def soft_dice_loss(probs: torch.Tensor, target_classes: torch.Tensor, classes) -> torch.Tensor:
+    """
+    1 - mean soft Dice coefficient over `classes`, averaged. probs: [B, C, ...] softmax
+    probabilities. target_classes: [B, ...] int64 class indices. Unlike cross-entropy
+    weighted by each voxel's TRUE class, Dice is symmetric in false positives/negatives:
+    predicting excess volume for a class grows the denominator (probs[:, c].sum()) without
+    growing the intersection, so over-prediction is penalized even where CE wouldn't (see
+    flow_matching_loss's dice_weight docstring).
+    """
+    dice_losses = []
+    for c in classes:
+        p_c = probs[:, c]
+        t_c = (target_classes == c).float()
+        intersection = (p_c * t_c).sum()
+        dice = (2 * intersection + 1.0) / (p_c.sum() + t_c.sum() + 1.0)
+        dice_losses.append(1 - dice)
+    return sum(dice_losses) / len(dice_losses)
+
+
 def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torch.device,
                         x0: Optional[torch.Tensor] = None,
-                        class_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+                        class_weights: Optional[torch.Tensor] = None,
+                        pixel_loss_weight: float = 0.0,
+                        dice_weight: float = 0.0,
+                        dice_classes: tuple = (2, 3)) -> torch.Tensor:
     """
     x0: optional source batch (same shape as x1). Defaults to Gaussian noise (the standard
     unconditional flow-matching source) when omitted, preserving this function's original
@@ -56,6 +78,24 @@ def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torc
     rare class (e.g. the lump, ~1% of voxels) exactly like background — getting it wrong
     barely moves the average loss, which is why the model learns the bulk anatomy well but
     is inconsistent on rare classes. Weighting by inverse class frequency corrects this.
+
+    pixel_loss_weight: if > 0, adds a class-weighted cross-entropy term on the one-step
+    endpoint estimate x1_hat = xt + (1-t)*v_pred (exact algebraically when v_pred == v_star,
+    since xt + (1-t)*(x1-x0) == x1 -- so this reuses v_pred from the SAME forward pass, no
+    extra network evaluation). This is NOT redundant with the velocity MSE term above: an
+    MSE loss on x1_hat would be exactly (1-t)^2 * the velocity MSE (same minimizer, same
+    gradient direction, just reweighted by t) -- pure algebraic restatement, not a new
+    signal. Cross-entropy is a genuinely different loss landscape: MSE's gradient shrinks
+    quadratically as a prediction approaches correct, so a velocity that's "80% of the right
+    magnitude" gets only a weak extra push once loss is already fairly low. Cross-entropy's
+    gradient stays large as long as the wrong class is still winning at a voxel, which
+    directly targets a model that hedges with an undercommitted (too-small) velocity instead
+    of actually crossing the decode threshold.
+
+    dice_weight: if > 0, adds a soft Dice loss (on the same x1_hat estimate, for
+    `dice_classes`) that penalizes predicted-volume mismatch symmetrically -- unlike
+    class-weighted cross-entropy, which only weights by each voxel's TRUE class and so has
+    no direct penalty for over-predicting a rare class where it doesn't belong.
     """
     x1 = x1.to(device)
     x0 = torch.randn_like(x1) if x0 is None else x0.to(device)
@@ -68,7 +108,32 @@ def flow_matching_loss(model: FlowMatchingUNet3D, x1: torch.Tensor, device: torc
     sq_err = (v_pred - v_star) ** 2
     if class_weights is not None:
         sq_err = sq_err * class_weights
-    return sq_err.mean()
+    loss = sq_err.mean()
+
+    if pixel_loss_weight > 0 or dice_weight > 0:
+        x1_hat = xt + (1 - t_) * v_pred
+        target_classes = x1.argmax(dim=1)
+
+    if pixel_loss_weight > 0:
+        ce_weight = class_weights.flatten() if class_weights is not None else None
+        pixel_loss = F.cross_entropy(x1_hat, target_classes, weight=ce_weight)
+        loss = loss + pixel_loss_weight * pixel_loss
+
+    if dice_weight > 0:
+        # F.cross_entropy's `weight` is applied by each voxel's TRUE class, not its
+        # predicted one -- missing a real lump voxel costs 12.57x/7.36x, but wrongly
+        # predicting lump/pillar at a true-background voxel only costs 1.0x. That
+        # asymmetry gives the model a direct incentive to over-predict these rare classes
+        # everywhere it's unsure, which is exactly the "huge blob instead of a small lump"
+        # failure this task's live runs showed (confirmed: ~24 disconnected predicted lump
+        # components vs ~1 expected). Dice is inherently symmetric -- predicting excess
+        # volume directly grows the denominator without growing the overlap numerator, so
+        # over-prediction is penalized here even though it wasn't penalized by CE.
+        probs = F.softmax(x1_hat, dim=1)
+        dice_loss = soft_dice_loss(probs, target_classes, dice_classes)
+        loss = loss + dice_weight * dice_loss
+
+    return loss
 
 
 def train_one_epoch(model, loader, optimizer, device, class_weights=None) -> float:

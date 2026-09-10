@@ -13,6 +13,37 @@ class RotateConfig:
     num_classes: int = 4
     # Same convention/values as Config.class_weights (background/insert/pillar/lump).
     class_weights: str = "1.0,1.03,12.57,7.36"
+    # Weight on an added cross-entropy term (see train.flow_matching_loss's docstring) on the
+    # one-step endpoint estimate x1_hat = xt + (1-t)*v_pred, class-weighted the same way. Plain
+    # velocity MSE lets the model hedge with an undercommitted (too-small) velocity that never
+    # crosses the discrete decode threshold -- diagnosed directly on this task's first live run
+    # (magnitude_ratio climbed to ~0.84 of target while the decoded prediction never moved at
+    # all across 10/10 validation pairs, unaffected by using up to 20x more ODE steps).
+    # Cross-entropy's gradient stays large as long as the wrong class is winning, targeting
+    # that specific failure mode. 1.0 is a starting point pending calibration against the
+    # velocity loss's own magnitude on a short run -- not yet empirically tuned.
+    pixel_loss_weight: float = 1.0
+    # Linearly decay pixel_loss_weight from its initial value to this one over the course of
+    # training (by epoch_num/epochs, so it continues correctly across a --resume_from too).
+    # The first full 1000-epoch run held pixel_loss_weight constant and the cross-entropy
+    # term's magnitude push never leveled off (magnitude_ratio settled at ~1.25-1.3x target
+    # instead of ~1.0, sustained overshoot for hundreds of epochs) -- let CE do the heavy
+    # lifting early (escape the "doesn't move" regime) while fading it out so the
+    # well-behaved, symmetric velocity MSE (and Dice, below) dominate refinement later.
+    pixel_loss_weight_final: float = 0.3
+    # Soft Dice loss weight on the lump/pillar channels (see flow_matching_loss's docstring)
+    # -- targets the "huge blob instead of a small lump" failure mode found by direct visual
+    # inspection of the first full run's predictions (~24 disconnected predicted lump
+    # components vs ~1 expected), which plain class-weighted cross-entropy does not penalize
+    # since it only weights by each voxel's TRUE class, not by over-predicting a wrong one.
+    dice_weight: float = 1.0
+    # EMA decay for a shadow copy of the model weights, used for preview/metric/checkpoint
+    # saving instead of the raw (noisier) training weights -- standard practice in
+    # diffusion/flow-matching training specifically because per-step weights fluctuate a lot,
+    # which we saw directly: metrics50/centroid_error_voxels_mean swung between ~17 and ~60
+    # from one 25-epoch checkpoint to the next in the first full run, without a clear trend.
+    # 0.999 gives roughly a ~10-epoch smoothing window at this task's ~100 steps/epoch.
+    ema_decay: float = 0.999
     base_ch: int = 8
     embed_channels: int = 16
     dropout: float = 0.1
@@ -46,6 +77,16 @@ class RotateConfig:
     # so this is deliberately much bigger than n_preview_val_pairs and never rendered as images.
     n_metric_val_pairs: int = 50
     checkpoint_epochs: str = "100,250,500,1000"  # comma-string, mirrors class_weights convention
+
+    # Path to a checkpoint (e.g. .../checkpoints/latest.pt) to resume from -- loads model +
+    # optimizer state and continues epoch numbering from where that checkpoint left off,
+    # instead of restarting at epoch 1. Str (not Path) to match run_tag's convention for an
+    # Optional field with a None default under build_config_from_cli's reflection.
+    resume_from: Optional[str] = None
+    # If resuming, reattach to this existing wandb run id (wandb.init(id=..., resume="must"))
+    # so the continued epochs land in the same run/chart instead of starting a disconnected
+    # new one. Leave unset to start a fresh run even when resuming model weights.
+    wandb_resume_id: Optional[str] = None
 
 
 def get_rotate_config() -> RotateConfig:

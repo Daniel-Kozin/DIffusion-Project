@@ -3,7 +3,8 @@ import torch
 
 from flow_model.data import RotationPairDataset, rotate_label_volume
 from flow_model.metrics import directional_signal_metrics, rotation_metrics
-from flow_model.train import flow_matching_loss
+from flow_model.train import flow_matching_loss, soft_dice_loss
+from flow_model.train_rotate180 import EMA, compute_pixel_loss_weight
 from flow_model.velocity_model import FlowMatchingUNet3D
 
 
@@ -77,3 +78,127 @@ def test_directional_signal_metrics_nan_when_nothing_changes():
     m = directional_signal_metrics(model, x0, x0.clone())  # x1 == x0 everywhere, no changed voxels
     assert m["cos_sim_mean"] != m["cos_sim_mean"]  # NaN
     assert m["magnitude_ratio_mean"] != m["magnitude_ratio_mean"]
+
+
+def test_flow_matching_loss_pixel_weight_zero_matches_omitted():
+    # pixel_loss_weight=0.0 must be bit-identical to not passing it at all -- every existing
+    # caller (train.py's unconditional loop, sanity_checks.py) omits it and must see zero
+    # behavior change.
+    torch.manual_seed(0)
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    x0 = torch.rand(1, 4, 26, 128, 128)
+    x1 = torch.rand(1, 4, 26, 128, 128)
+
+    torch.manual_seed(1)
+    loss_omitted = flow_matching_loss(model, x1, torch.device("cpu"), x0=x0)
+    torch.manual_seed(1)
+    loss_explicit_zero = flow_matching_loss(model, x1, torch.device("cpu"), x0=x0, pixel_loss_weight=0.0)
+    assert torch.allclose(loss_omitted, loss_explicit_zero)
+
+
+def test_pixel_loss_is_not_redundant_with_velocity_loss():
+    # Regression guard: an earlier (rejected) version of this pixel loss used MSE on the
+    # one-step endpoint estimate x1_hat = xt + (1-t)*v_pred, which is algebraically EXACTLY
+    # (1-t)^2 times the velocity MSE term -- same minimizer, same gradient direction, just a
+    # per-example reweighting, not a new training signal. The actual fix uses cross-entropy
+    # instead, which has a genuinely different gradient landscape. This test checks that the
+    # gradient with pixel_loss_weight>0 is NOT just a positive rescaling of the velocity-only
+    # gradient (which is what the redundant MSE version would have produced).
+    torch.manual_seed(0)
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    x0 = torch.rand(1, 4, 26, 128, 128)
+    x1 = torch.rand(1, 4, 26, 128, 128)
+
+    def flat_grad(pixel_loss_weight):
+        model.zero_grad()
+        torch.manual_seed(42)  # same sampled t and same forward pass for a fair comparison
+        loss = flow_matching_loss(model, x1, torch.device("cpu"), x0=x0, pixel_loss_weight=pixel_loss_weight)
+        loss.backward()
+        return torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+
+    g_velocity_only = flat_grad(0.0)
+    g_with_pixel = flat_grad(1.0)
+
+    # A TRUE algebraic redundancy (like the rejected MSE version) makes g_with_pixel an exact
+    # positive scalar multiple of g_velocity_only, so cos_sim is 1.0 up to float32 rounding
+    # (~1e-6). 0.99999 leaves ample margin above that noise floor while still failing on an
+    # actual identity -- a small, untrained, random-input toy model can legitimately show
+    # high (but not identity-level) correlation between two genuinely different losses.
+    cos_sim = torch.nn.functional.cosine_similarity(g_velocity_only.unsqueeze(0), g_with_pixel.unsqueeze(0)).item()
+    assert cos_sim < 0.99999, (
+        f"pixel loss gradient is suspiciously close to an exact scalar multiple of the "
+        f"velocity-only gradient (cos_sim={cos_sim:.6f}) -- looks like the redundant-MSE bug"
+    )
+
+
+def test_soft_dice_loss_zero_for_perfect_match():
+    target = torch.zeros(1, 4, 4, dtype=torch.long)
+    target[0, 1, 1] = 3  # a single lump voxel
+    probs = torch.nn.functional.one_hot(target, num_classes=4).permute(0, 3, 1, 2).float()
+    loss = soft_dice_loss(probs, target, classes=(3,))
+    assert loss.item() < 1e-3
+
+
+def test_soft_dice_loss_penalizes_over_prediction_that_cross_entropy_barely_sees():
+    # True: a single lump voxel. Predicted: covers that voxel PLUS 10 extra background
+    # voxels confidently classified as lump -- the "huge blob" failure mode this loss
+    # targets. Dice should be clearly penalized (it directly measures volume overlap);
+    # class-weighted CE would barely react since the 10 false positives are weighted at
+    # their TRUE class (background, weight=1.0), not at the wrongly-predicted lump weight.
+    target = torch.zeros(1, 6, 6, dtype=torch.long)
+    target[0, 2, 2] = 3
+    probs = torch.zeros(1, 4, 6, 6)
+    probs[0, 0] = 1.0  # everything defaults to confident background
+    # confidently (mis)predict lump at the true voxel plus 10 background voxels
+    lump_voxels = [(2, 2)] + [(r, c) for r in range(6) for c in range(6) if (r, c) != (2, 2)][:10]
+    for r, c in lump_voxels:
+        probs[0, :, r, c] = 0.0
+        probs[0, 3, r, c] = 1.0
+
+    loss = soft_dice_loss(probs, target, classes=(3,))
+    # true=1 voxel, predicted=11 voxels, intersection=1 -> dice = 2*1/(1+11) = 1/6, loss = 5/6
+    assert loss.item() > 0.5
+
+
+def test_compute_pixel_loss_weight_interpolates_and_handles_resume():
+    class Cfg:
+        pixel_loss_weight = 1.0
+        pixel_loss_weight_final = 0.3
+        epochs = 100
+
+    cfg = Cfg()
+    assert compute_pixel_loss_weight(cfg, 0) == 1.0
+    assert abs(compute_pixel_loss_weight(cfg, 100) - 0.3) < 1e-9
+    mid = compute_pixel_loss_weight(cfg, 50)
+    assert 0.3 < mid < 1.0
+    # continues correctly for a run resumed partway through -- schedule depends only on the
+    # absolute epoch_num/epochs, not on how many epochs *this session* has run
+    assert compute_pixel_loss_weight(cfg, 75) == compute_pixel_loss_weight(cfg, 75)
+
+
+def test_ema_tracks_and_smooths_model_weights():
+    torch.manual_seed(0)
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    ema = EMA(model, decay=0.9)
+    param_name = next(k for k, v in model.state_dict().items() if torch.is_floating_point(v))
+    old_ema_value = ema.shadow[param_name].clone()
+
+    # simulate a large, sudden parameter jump (like one noisy SGD step)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    ema.update(model)
+
+    raw_value = model.state_dict()[param_name]
+    new_ema_value = ema.shadow[param_name]
+    # EMA should have moved toward the new value but by less than the full jump
+    assert not torch.allclose(new_ema_value, raw_value)
+    assert (new_ema_value - old_ema_value).abs().sum() < (raw_value - old_ema_value).abs().sum()
+
+
+def test_ema_load_state_dict_replaces_shadow():
+    model = FlowMatchingUNet3D(num_classes=4, base_ch=4, embed_channels=8)
+    ema = EMA(model, decay=0.999)
+    new_state = {k: torch.zeros_like(v) for k, v in model.state_dict().items()}
+    ema.load_state_dict(new_state)
+    assert all(torch.equal(v, torch.zeros_like(v)) for v in ema.shadow.values())
