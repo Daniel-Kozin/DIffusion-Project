@@ -848,9 +848,26 @@ roughly linearly step over step, reaching a magnitude comparable to the pair's o
 $x_0$-to-$x_1$ distance well before the trajectory completes).
 
 \hsub{17. Fix 3: training on the model's own rollout, not just the teacher-forced line}
-The direct fix is to expose the network, during training, to states reached by \emph{its own}
-imperfect steps, not only the idealized line. A short, gradient-tracked rollout from $x_0$
-using the model's own predictions at each step,
+\textbf{What ``rollout loss'' means, in plain terms.} Every loss used up to this point
+(velocity MSE, the cross-entropy/Dice endpoint terms) is computed at a state the network never
+had to reach on its own: a point $x_t$ constructed directly from the real, known pair
+$(x_0, x_1)$ via Eq.~\eqref{eq:path}. During training the network is only ever asked ``given
+this exact point on the true straight line, what's the right velocity?'' --- a question with
+an always-correct answer sitting right there in the data. At inference, though, nobody hands
+the network a point on the true line after the first step: it has to integrate its own
+predicted velocity forward, and any small error in step 1 moves it slightly off the ideal
+path, so at step 2 it's answering a question (``what's the velocity \emph{here}?'') for a state
+it never trained on. Those small errors compound step after step (Section~16's exposure-bias
+finding). \emph{Rollout loss} fixes the mismatch by training on exactly the states the network
+itself produces: instead of jumping straight to a known point on the line, let the network take
+a few real self-directed steps from $x_0$ --- using its own output as the input to the next
+step, exactly as it will at inference --- and only then apply the loss, at wherever the network
+actually ended up. This means the network is now practicing on its own mistakes during
+training, not just on a clean, idealized version of the task it will never actually see again
+once it starts generating on its own.
+
+Formally, a short, gradient-tracked rollout from $x_0$ using the model's own predictions at
+each step,
 \begin{equation}
 x^{(0)} = x_0, \qquad x^{(i+1)} = x^{(i)} + v_\theta\big(x^{(i)}, i\,\Delta t\big)\,\Delta t,
 \quad i = 0,\dots,k-1, \quad \Delta t = t_{\text{end}}/k, \label{eq:rollout}
@@ -1128,5 +1145,31 @@ intermediate integration step, and the final prediction.}
   validation set plus a matched train sample, confirming combined Dice
   $0.453 \pm 0.151$ with no overfitting (Section~26).
 \end{itemize}
+
+\hsec{Final results, across the whole project}
+Table~\ref{tab:milestones} tracks mask Dice (the trusted metric throughout, Section~15) across
+every major fix to the rotate180 task, end to end. Each row is a genuinely different model,
+not a re-measurement of the same one: the metric only exists from Section~15 onward, since
+mask overlap wasn't computed before that point (earlier stages are annotated qualitatively,
+from direct visual inspection of the decoded output).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}ccp{4.4cm}@{}}
+\toprule
+Stage & Comb.\ Dice & Lump Dice & Notes \\
+\midrule
+Velocity MSE only (\S11) & --- & --- & prediction never moves off $x_0$ \\
+$+$ cross-entropy endpoint (\S12--13) & --- & --- & moves, but a $\sim$20--60-component blob \\
+$+$ Dice loss, decay, EMA (\S14) & 0.13 & --- & blob fixed; still low overlap (\S15) \\
+$+$ rollout-consistency fine-tune (\S17, \S26) & \textbf{0.453} & \textbf{0.472} & final model, epoch 1250 EMA, full 176-pair val set \\
+\bottomrule
+\end{tabular}
+\caption{Mask Dice across the project's major modeling stages. The rollout-consistency fix
+is responsible for roughly a $3.5\times$ improvement in combined Dice over the previous
+best measured result.}
+\label{tab:milestones}
+\end{table}
 
 \end{document}
