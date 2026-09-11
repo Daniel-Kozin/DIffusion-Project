@@ -927,4 +927,103 @@ upward over a longer horizon; results were not yet available at the time of writ
   diagnostic pass, and a cross-checkpoint evaluation script (Section~18).
 \end{itemize}
 
+\hsec{Part III --- Cleanup, a rendering bug, and the rollout-loss follow-through}
+
+\hsub{19. Removing the legacy metrics everywhere, not just from the headline number}
+Mask IoU/Dice had been adopted as the trusted metric (Section~15), but the older
+voxel-agreement and centroid-error numbers were still being computed and logged alongside it
+in the training-time diagnostic pass and in wandb, which made the dashboards noisy and easy to
+misread at a glance. \texttt{metrics.rotation\_metrics} keeps those legacy fields internally
+(cheap to compute, occasionally useful for debugging a specific pair by hand) but every logging
+site was audited and cut down to only the six trusted numbers: \texttt{lump\_iou},
+\texttt{lump\_dice}, \texttt{pillar\_iou}, \texttt{pillar\_dice}, \texttt{combined\_iou},
+\texttt{combined\_dice}. This touched the training loop's diagnostic pass, the qualitative
+figure's annotation text box, and both evaluation scripts.
+
+\hsub{20. A machine-wide GPU memory leak in the rendering path}
+Shortly after Section~19's cleanup, the qualitative wandb figures went black across every
+run. The obvious suspect --- two training processes sharing GPU memory --- turned out to be
+wrong: \texttt{nvidia-smi} showed one training process holding 23.8\,GB as a \emph{graphics}
+context allocation on a GPU that process never used for its actual PyTorch tensors, i.e. the
+leak was in off-screen rendering, not in PyTorch. The renderer (\texttt{PyVista}, wrapping
+VTK) never closed its \texttt{Plotter} objects on the off-screen path, so every rendered
+figure permanently pinned a VTK graphics context until the GPU's memory was exhausted and
+subsequent renders silently came back black. Confirmed via \texttt{git stash}/\texttt{git
+stash pop} that this bug pre-existed this session's own changes (it was a latent bug, not a
+regression introduced by the metrics cleanup), reproduced it in isolation, then fixed it with
+an explicit \texttt{plotter.close()} in the renderer's \texttt{finally} block. Verified by
+killing both affected processes, confirming the GPU's memory dropped from 23.8\,GB to
+288\,MB, and re-rendering a real phantom to confirm correct (non-black) output.
+
+\hsub{21. Extending and repeating the rollout-loss run}
+Section~17 left an open question --- does the rollout-consistency fine-tune actually trend
+upward over a longer horizon? Three further training decisions followed directly from
+watching that run and wanting a clean answer:
+\begin{itemize}[nosep]
+\item The fine-tune was restarted under a \emph{fresh} wandb run id rather than continuing to
+  log into the pre-cleanup run, so the mask-only dashboard (Section~19) and the rendering fix
+  (Section~20) would both be visible from the start of a clean run rather than appearing
+  mid-way through an existing one's history.
+\item A \emph{second}, fully independent run was launched from scratch using only the
+  rollout-consistency loss (no fix-14 warm start), to separate two possible explanations for
+  the fine-tune's behavior: is rollout training itself weak, or is it constrained by starting
+  from a checkpoint already biased by the earlier losses?
+\item After the fine-tune run showed slow but real improvement, it was extended by a further
+  500 epochs under the same wandb run id (rather than starting yet another run), while the
+  from-scratch run continued independently on a separate GPU. Both were run concurrently once
+  GPU headroom allowed it, deliberately waiting for a GPU to free up naturally rather than
+  reducing batch size to force a fit on a contended GPU.
+\end{itemize}
+
+\hsub{22. IoU versus Dice: why report both}
+Both are set-overlap scores between the predicted and true binary mask, $A$ = predicted
+voxels, $B$ = true voxels:
+\[
+\mathrm{IoU} = \frac{|A \cap B|}{|A \cup B|}, \qquad
+\mathrm{Dice} = \frac{2|A \cap B|}{|A| + |B|}.
+\]
+They are monotonic transforms of each other for a \emph{single} pair
+($\mathrm{Dice} = 2\,\mathrm{IoU}/(1+\mathrm{IoU})$, so Dice $\geq$ IoU always, with the gap
+largest at moderate overlap and vanishing at IoU $\to 0$ or $1$), but that exact relationship
+does not carry over to \emph{means} across many pairs, since the transform is nonlinear ---
+averaging first and transforming, versus transforming first and averaging, give different
+numbers. Both are reported per-class (lump, pillar) and combined so a reader can sanity-check
+one against the other rather than trusting a single scalar.
+
+\hsub{23. \texttt{eval\_trajectory.py}: full-dataset metrics plus a trajectory figure}
+A new script combines two things the existing \texttt{eval\_rotate180.py} did not do together:
+a full-validation-set (and optionally a matched train-sample) metrics pass on one checkpoint,
+and a qualitative figure showing how a single prediction evolves across the ODE integration
+from $t{=}0$ to $t{=}1$, not just its start and end points. \texttt{ode.sample} was extended
+with an opt-in \texttt{return\_trajectory} flag (default off, verified to leave every existing
+caller's behavior unchanged) that returns the state after every integration step instead of
+only the final one.
+
+The trajectory figure went through two rounds of redesign based on direct feedback on how
+useful the first drafts actually were. The first version paired a per-frame image filmstrip
+with a line chart of Dice score over the trajectory; this was replaced with a schematic
+plotting the lump centroid's $(W,H)$ position at every $t$ (color-graded by $t$, true $180^\circ$
+target marked separately), since the position-over-time view is more directly diagnostic of
+\emph{whether the model moves the lump at all} than a Dice-vs-$t$ curve is. The second round
+rebalanced panel sizes so the frame-by-frame filmstrip --- the main qualitative evidence ---
+dominates the figure, with the original/predicted panels shown small alongside it rather than
+each claiming half the figure's width.
+
+\hsec{Summary of concrete changes made this session (Part III)}
+\begin{itemize}[nosep]
+\item Audited every logging site (training diagnostics, qualitative figure annotations, both
+  eval scripts) to remove the legacy voxel-agreement/centroid-error metrics, keeping only the
+  six trusted mask IoU/Dice numbers (Section~19).
+\item Diagnosed and fixed a machine-wide VTK/PyVista GPU memory leak in the off-screen
+  rendering path that was silently corrupting every logged figure; verified the fix predates
+  and is independent of this session's other changes (Section~20).
+\item Restarted the rollout fine-tune under a fresh wandb run id, launched an independent
+  from-scratch rollout-only run, and extended the fine-tune by a further 500 epochs once it
+  showed real improvement, running both concurrently once GPU headroom allowed it
+  (Section~21).
+\item Built \texttt{eval\_trajectory.py}: a full-dataset metrics pass plus a per-example
+  trajectory figure showing the ODE integration state at every step, iterated twice on figure
+  design based on direct feedback (Section~23).
+\end{itemize}
+
 \end{document}
