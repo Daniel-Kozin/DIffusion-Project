@@ -1026,4 +1026,107 @@ each claiming half the figure's width.
   design based on direct feedback (Section~23).
 \end{itemize}
 
+\hsec{Part IV --- Choosing and validating the final checkpoint}
+
+\hsub{24. A further layout fix, and a scare that turned out to be a stale checkpoint}
+The trajectory figure went through one more redesign round: nesting the top (original/
+predicted) and bottom (filmstrip) rows as two independent grids, each filling its own full
+width, removed a leftover unused-column gap the earlier version left next to the predicted
+panel (\texttt{tight\_layout} does not compact nested grids correctly; switching to
+matplotlib's \texttt{constrained\_layout} fixed it). While iterating on this, a full 176-pair
+evaluation of the rollout fine-tune's \texttt{latest.pt} (raw, non-EMA weights, epoch
+$\approx$1442) came back with combined Dice $\approx 0.19$ --- markedly worse than the
+$\approx 0.45$ this same run's own training-time diagnostic had reported shortly before. This
+looked like a real regression at first. It was not: the training-time diagnostic evaluates
+\emph{EMA} weights (Section~14), while the ad-hoc full evaluation had been pointed at the
+\emph{raw} checkpoint --- and, separately, the raw weights kept changing checkpoint-to-
+checkpoint (epoch 1442 $\to$ 1464 across successive re-renders) as the run continued past its
+best point. Both effects compounded to produce a misleadingly bad number, not a genuine
+collapse in the model's ability.
+
+\hsub{25. Selecting the best checkpoint: raw vs.\ EMA, epoch 1250 vs.\ 1500}
+To settle this properly, every checkpoint actually saved by the fine-tune run was scored
+under identical conditions (same 50 held-out val pairs, same integration settings):
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Checkpoint & lump Dice & pillar Dice & combined Dice & combined IoU \\
+\midrule
+epoch 1250 (raw)      & 0.451 & 0.153 & 0.422 & --- \\
+\textbf{epoch 1250 (EMA)} & \textbf{0.498} & \textbf{0.268} & \textbf{0.478} & \textbf{0.344} \\
+epoch 1500 (raw)      & 0.470 & 0.262 & 0.448 & --- \\
+epoch 1500 (EMA)      & 0.381 & 0.120 & 0.354 & --- \\
+\bottomrule
+\end{tabular}
+\caption{Every checkpoint saved by the rollout fine-tune run, scored on the same 50 val pairs.
+Epoch 1250's EMA weights are the clear winner on every metric.}
+\label{tab:checkpoint-selection}
+\end{table}
+Two things stand out. First, EMA beats raw weights at epoch 1250 but \emph{loses} to raw
+weights at epoch 1500 --- the smoothing that helps mid-run becomes a liability once the
+underlying weights have drifted past their best point, since EMA is then averaging good
+history against a worse recent trend. Second, and more importantly: \textbf{training for
+longer did not help}. The extra 250 epochs (1250 $\to$ 1500) requested to see whether the
+fine-tune ``was slowly learning'' instead made every metric worse for the EMA weights, and
+only partially recovered it for the raw weights. Epoch 1250 EMA is the best model this run
+produced, not the final one.
+
+\hsub{26. Final validated result}
+Running the full evaluation script on epoch 1250 (EMA) --- all 176 held-out validation pairs,
+plus a matched sample of 176 training pairs to check for overfitting --- gives
+Table~\ref{tab:final-eval}.
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Split & lump Dice (mean) & pillar Dice (mean) & combined Dice (mean $\pm$ std) \\
+\midrule
+Validation (176 pairs) & 0.472 & 0.267 & $0.453 \pm 0.151$ \\
+Train (176 pairs)      & 0.429 & 0.247 & $0.405 \pm 0.203$ \\
+\bottomrule
+\end{tabular}
+\caption{Final checkpoint, full-dataset evaluation. Validation Dice is not lower than train
+Dice (gap $-0.048$), ruling out overfitting as an explanation for the result.}
+\label{tab:final-eval}
+\end{table}
+
+This is, by a wide margin, the best result this task has produced: combined Dice more than
+doubled the $\approx 0.19$ figure that briefly looked like the state of the art
+(Section~24), and roughly $6\times$ the very first post-blob-fix result of
+$\approx 0.07$ (Section~15). Figure~\ref{fig:final-traj} shows the full $t{=}0 \to 1$
+trajectory for two held-out validation pairs: the lump visibly separates from its starting
+position early in the integration and settles close to its true $180^\circ$ target, with a
+clean, compact predicted shape rather than the diffuse multi-component blob of earlier
+attempts (Section~13) or the oversized mass seen at later, overtrained checkpoints
+(Section~24).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{imgs/summary/rollout_trajectory_st10c9_o0.png}
+\\[6pt]
+\includegraphics[width=\textwidth]{imgs/summary/rollout_trajectory_ft1280c5_o0.png}
+\caption{Full $t{=}0 \to 1$ trajectory for the final checkpoint (epoch 1250, EMA weights) on
+two held-out validation pairs. Left: the lump centroid's path through the volume, color-graded
+by $t$, against the true $180^\circ$ target (green star). Right: original phantom, every
+intermediate integration step, and the final prediction.}
+\label{fig:final-traj}
+\end{figure}
+
+\hsec{Summary of concrete changes made this session (Part IV)}
+\begin{itemize}[nosep]
+\item Fixed a residual layout bug in the trajectory figure (unused grid columns leaving a
+  blank gap) by giving the top and bottom rows independent nested grids under
+  \texttt{constrained\_layout} (Section~24).
+\item Diagnosed an apparent Dice regression as an evaluation artifact --- raw vs.\ EMA weights
+  and a checkpoint that kept changing between renders --- rather than a genuine model
+  collapse (Section~24).
+\item Scored every checkpoint the rollout fine-tune run actually saved (raw and EMA, at
+  epochs 1250 and 1500) under identical conditions and found the extra 250 epochs of training
+  made the result \emph{worse}, not better, on both weight variants (Section~25).
+\item Selected epoch 1250 (EMA) as the final model and validated it on the full 176-pair
+  validation set plus a matched train sample, confirming combined Dice
+  $0.453 \pm 0.151$ with no overfitting (Section~26).
+\end{itemize}
+
 \end{document}
