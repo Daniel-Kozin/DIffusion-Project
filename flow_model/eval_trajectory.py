@@ -16,6 +16,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpecFromSubplotSpec
 import torch
 import wandb
 
@@ -70,13 +71,15 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
     ws = [p[0] if p is not None else fallback[0] for p in frame_positions]
     hs = [p[1] if p is not None else fallback[1] for p in frame_positions]
 
-    left_cols = 3
-    top_w = max(n_frames // 5, 1)  # small, fixed-size orig/pred panels (not half the row)
-    fig = plt.figure(figsize=(2.6 * n_frames, 9.5))
-    gs = fig.add_gridspec(2, left_cols + n_frames, height_ratios=[0.7, 1.8])
+    # constrained_layout (not tight_layout) is required here: the top (orig/pred) and bottom
+    # (filmstrip) rows are each their OWN nested gridspec spanning the full available width,
+    # rather than sharing one grid with unused columns -- tight_layout doesn't compact nested
+    # gridspecs correctly and leaves a large blank gap where the unused columns used to be.
+    fig = plt.figure(figsize=(1.7 * n_frames, 5.5), layout="constrained")
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 2.6])
 
     # --- left: lump centroid position at every t, connected and color-graded by t ---
-    ax_left = fig.add_subplot(gs[:, 0:left_cols])
+    ax_left = fig.add_subplot(outer[0, 0])
     ax_left.plot(ws, hs, "-", color="gray", alpha=0.5, zorder=1, linewidth=1)
     sc = ax_left.scatter(ws, hs, c=t_values, cmap="coolwarm", s=90, zorder=3,
                           edgecolor="black", linewidth=0.5)
@@ -98,12 +101,13 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
     ax_left.set_ylabel("H (voxels)")
     ax_left.set_title("Lump centroid position, t=0 -> 1")
 
-    # --- top right: original (t=0) and predicted (t=1), large ---
-    # aspect="equal" + a fixed extent is set explicitly on every imshow here: the row0 cells
-    # span multiple filmstrip columns (wide, short box) while row1 cells are ~square, and
-    # imshow's aspect can otherwise be silently overridden by the containing GridSpec cell's
-    # box shape, stretching the (square) render non-uniformly -- same array, distorted display.
-    ax_orig = fig.add_subplot(gs[0, left_cols:left_cols + top_w])
+    # --- top right: original (t=0) and predicted (t=1), large -- own nested 1x2 grid so it
+    # fills the full row width with no unused columns ---
+    right = GridSpecFromSubplotSpec(2, 1, subplot_spec=outer[0, 1], height_ratios=[1, 3.2])
+    top_gs = GridSpecFromSubplotSpec(1, 2, subplot_spec=right[0, 0])
+    bottom_gs = GridSpecFromSubplotSpec(1, n_frames, subplot_spec=right[1, 0])
+
+    ax_orig = fig.add_subplot(top_gs[0, 0])
     ax_orig.imshow(frame_imgs[0], aspect="equal")
     ax_orig.set_title("original (t=0)", fontsize=10, color="tab:blue")
     ax_orig.set_xticks([])
@@ -113,7 +117,7 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
         spine.set_edgecolor("tab:blue")
         spine.set_linewidth(3)
 
-    ax_pred = fig.add_subplot(gs[0, left_cols + top_w:left_cols + 2 * top_w])
+    ax_pred = fig.add_subplot(top_gs[0, 1])
     ax_pred.imshow(frame_imgs[-1], aspect="equal")
     ax_pred.set_title("predicted (t=1)", fontsize=10, color="tab:red")
     ax_pred.set_xticks([])
@@ -122,12 +126,10 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
         spine.set_visible(True)
         spine.set_edgecolor("tab:red")
         spine.set_linewidth(3)
-    # remaining row0 columns to the right of orig/pred are left blank on purpose -- they keep
-    # the small original/predicted panels from stretching to fill the full filmstrip width
 
-    # --- bottom right: every frame, in order (the main event -- given the most space) ---
+    # --- bottom right: every frame, in order -- own nested 1xn grid, own full row width ---
     for col in range(n_frames):
-        ax = fig.add_subplot(gs[1, left_cols + col])
+        ax = fig.add_subplot(bottom_gs[0, col])
         ax.imshow(frame_imgs[col], aspect="equal")
         ax.set_xticks([])
         ax.set_yticks([])
@@ -139,7 +141,6 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
             spine.set_linewidth(1.5)
 
     fig.suptitle(title, fontsize=12)
-    plt.tight_layout()
     return fig
 
 
