@@ -21,7 +21,7 @@ import wandb
 
 from .data import build_rotation_pair_datasets
 from .eval_rotate180 import evaluate_checkpoint, load_model_from_checkpoint, summarize
-from .metrics import lump_centroid_hw, mask_dice
+from .metrics import lump_centroid_hw
 from .ode import sample
 from .train import get_device
 from .viz_utils import render_label_volumes
@@ -44,10 +44,13 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
                               device: torch.device, title: str):
     """
     Integrates x0 -> x1_hat over n_steps (capturing every intermediate state), decodes
-    n_frames evenly-spaced snapshots (including t=0 and t=1) to label volumes, renders each,
-    and plots them in a row alongside the true target for reference. Also tracks each frame's
-    lump centroid and its Dice-vs-target (on the lump+pillar combined mask) so the plot shows
-    not just what each frame looks like, but how close it already is to the true answer.
+    n_frames evenly-spaced snapshots (including t=0 and t=1) to label volumes, and renders:
+      - left: the lump centroid's (W, H) position at every one of those frames, connected in
+        order and color-graded t=0 (blue) -> t=1 (red), plus the true target position as a
+        green star -- the same position-schematic language used in rotation_result_figure,
+        generalized from 3 fixed points to the whole path.
+      - top right: original (t=0) and final prediction (t=1), shown large.
+      - bottom right: every frame as a filmstrip, in order.
     """
     x0_b, x1_b = x0.unsqueeze(0).to(device), x1.unsqueeze(0).to(device)
     _, trajectory = sample(model, n_steps, x0=x0_b, device=device, t_start=0.0, t_end=1.0,
@@ -59,31 +62,83 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
     expected_label = x1.argmax(dim=0)
     frame_labels = [trajectory[s].argmax(dim=1)[0].cpu() for s in frame_steps]
     frame_imgs = render_label_volumes(frame_labels, names=[f"{title}_t{t:.2f}" for t in t_values])
-    dice_vs_target = [mask_dice(fl, expected_label, (2, 3)) or 0.0 for fl in frame_labels]
 
-    fig, axes = plt.subplots(2, n_frames, figsize=(2.2 * n_frames, 5.2),
-                              gridspec_kw={"height_ratios": [3, 1]})
+    frame_positions = [lump_centroid_hw(fl) for fl in frame_labels]
+    expected_position = lump_centroid_hw(expected_label)
+    H, W = x0.shape[-2], x0.shape[-1]
+    fallback = (W / 2, H / 2)
+    ws = [p[0] if p is not None else fallback[0] for p in frame_positions]
+    hs = [p[1] if p is not None else fallback[1] for p in frame_positions]
+
+    left_cols = 3
+    half = max(n_frames // 2, 1)
+    fig = plt.figure(figsize=(3 + 1.8 * n_frames, 6.5))
+    gs = fig.add_gridspec(2, left_cols + n_frames, height_ratios=[1.3, 1])
+
+    # --- left: lump centroid position at every t, connected and color-graded by t ---
+    ax_left = fig.add_subplot(gs[:, 0:left_cols])
+    ax_left.plot(ws, hs, "-", color="gray", alpha=0.5, zorder=1, linewidth=1)
+    sc = ax_left.scatter(ws, hs, c=t_values, cmap="coolwarm", s=90, zorder=3,
+                          edgecolor="black", linewidth=0.5)
+    if expected_position is not None:
+        ax_left.scatter([expected_position[0]], [expected_position[1]], s=260, color="tab:green",
+                         marker="*", zorder=4, label="expected (true 180°)")
+        ax_left.annotate("expected", expected_position, textcoords="offset points", xytext=(10, -10),
+                          fontsize=9, color="tab:green")
+        ax_left.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    ax_left.annotate("t=0 (original)", (ws[0], hs[0]), textcoords="offset points", xytext=(-10, 10),
+                      ha="right", fontsize=9, color="tab:blue")
+    ax_left.annotate("t=1 (predicted)", (ws[-1], hs[-1]), textcoords="offset points", xytext=(10, 10),
+                      ha="left", fontsize=9, color="tab:red")
+    fig.colorbar(sc, ax=ax_left, fraction=0.046, pad=0.04).set_label("t")
+    ax_left.set_xlim(0, W)
+    ax_left.set_ylim(H, 0)  # inverted so row 0 is at the top, matching image orientation
+    ax_left.set_aspect("equal")
+    ax_left.set_xlabel("W (voxels)")
+    ax_left.set_ylabel("H (voxels)")
+    ax_left.set_title("Lump centroid position, t=0 -> 1")
+
+    # --- top right: original (t=0) and predicted (t=1), large ---
+    # aspect="equal" + a fixed extent is set explicitly on every imshow here: the row0 cells
+    # span multiple filmstrip columns (wide, short box) while row1 cells are ~square, and
+    # imshow's aspect can otherwise be silently overridden by the containing GridSpec cell's
+    # box shape, stretching the (square) render non-uniformly -- same array, distorted display.
+    ax_orig = fig.add_subplot(gs[0, left_cols:left_cols + half])
+    ax_orig.imshow(frame_imgs[0], aspect="equal")
+    ax_orig.set_title("original (t=0)", fontsize=11, color="tab:blue")
+    ax_orig.set_xticks([])
+    ax_orig.set_yticks([])
+    for spine in ax_orig.spines.values():
+        spine.set_visible(True)
+        spine.set_edgecolor("tab:blue")
+        spine.set_linewidth(3)
+
+    ax_pred = fig.add_subplot(gs[0, left_cols + half:left_cols + n_frames])
+    ax_pred.imshow(frame_imgs[-1], aspect="equal")
+    ax_pred.set_title("predicted (t=1)", fontsize=11, color="tab:red")
+    ax_pred.set_xticks([])
+    ax_pred.set_yticks([])
+    for spine in ax_pred.spines.values():
+        spine.set_visible(True)
+        spine.set_edgecolor("tab:red")
+        spine.set_linewidth(3)
+
+    # --- bottom right: every frame, in order ---
     for col in range(n_frames):
-        axes[0, col].imshow(frame_imgs[col])
-        axes[0, col].set_xticks([])
-        axes[0, col].set_yticks([])
-        axes[0, col].set_title(f"t={t_values[col]:.2f}", fontsize=9)
-        for spine in axes[0, col].spines.values():
+        ax = fig.add_subplot(gs[1, left_cols + col])
+        ax.imshow(frame_imgs[col], aspect="equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f"t={t_values[col]:.2f}", fontsize=8)
+        color = "tab:blue" if col == 0 else ("tab:red" if col == n_frames - 1 else "gray")
+        for spine in ax.spines.values():
             spine.set_visible(True)
-            spine.set_edgecolor("tab:blue" if col == 0 else ("tab:orange" if col == n_frames - 1 else "gray"))
-            spine.set_linewidth(2)
+            spine.set_edgecolor(color)
+            spine.set_linewidth(1.5)
 
-    for ax in axes[1, :]:
-        ax.remove()
-    ax_trend = fig.add_subplot(2, 1, 2)
-    ax_trend.plot(t_values, dice_vs_target, marker="o", color="tab:green")
-    ax_trend.set_xlabel("t")
-    ax_trend.set_ylabel("combined Dice\nvs true target")
-    ax_trend.set_ylim(-0.05, 1.05)
-    ax_trend.grid(alpha=0.3)
-    fig.suptitle(title, fontsize=11)
+    fig.suptitle(title, fontsize=12)
     plt.tight_layout()
-    return fig, dice_vs_target
+    return fig
 
 
 def main():
@@ -202,8 +257,7 @@ def main():
         x0, x1 = val_ds[idx]
         case_id, variant_idx, orientation = val_ds.index[idx]
         title = f"{case_id} o{orientation} (final combined Dice={values['combined_dice'][i]:.3f})"
-        fig_traj, dice_curve = render_trajectory_figure(model, x0, x1, args.n_steps, args.n_trajectory_frames,
-                                                          device, title)
+        fig_traj = render_trajectory_figure(model, x0, x1, args.n_steps, args.n_trajectory_frames, device, title)
         wandb.log({f"trajectory/{args.trajectory_selection}_{rank}_{case_id}_o{orientation}": wandb.Image(fig_traj)})
         plt.close(fig_traj)
 
