@@ -41,6 +41,60 @@ def load_model_from_checkpoint(path: Path, device: torch.device):
     return model, state.get("epoch", "?")
 
 
+def evaluate_checkpoint(model, val_ds, eval_indices, device: torch.device, n_steps: int,
+                         method: str = "euler", render_indices=None, tag_prefix: str = "eval") -> dict:
+    """
+    Runs a forward integration (no inversion -- x0 is already real data) for every index in
+    eval_indices and aggregates the trusted mask metrics (lump/pillar/combined IoU and Dice).
+    Shared by eval_rotate180.py (compares several checkpoints) and any other script that wants
+    a full-dataset metrics pass against one checkpoint.
+
+    render_indices: optional subset of eval_indices to also log the qualitative 6-image
+    figure for (tagged f"{tag_prefix}/pair_{case_id}_o{orientation}"). None/empty disables
+    rendering entirely.
+
+    Returns per-metric lists (not just means) so the caller can compute std/min/max or a
+    histogram without re-running -- averages alone hide the per-pair variance this task has
+    shown throughout (see project_summary.tex Part II).
+    """
+    render_indices = render_indices or set()
+    lump_ious, lump_dices, pillar_ious, pillar_dices, combined_ious, combined_dices = [], [], [], [], [], []
+
+    for idx in eval_indices:
+        x0, x1 = val_ds[idx]
+        case_id, variant_idx, orientation = val_ds.index[idx]
+        x1_hat = sample(model, n_steps, x0=x0.unsqueeze(0).to(device), device=device,
+                         method=method, t_start=0.0, t_end=1.0)
+        pred_label = x1_hat.argmax(dim=1)[0].cpu()
+        expected_label = x1.argmax(dim=0)
+        orig_label = x0.argmax(dim=0)
+
+        m = rotation_metrics(pred_label, expected_label)
+        if m["lump_iou"] is not None:
+            lump_ious.append(m["lump_iou"])
+            lump_dices.append(m["lump_dice"])
+        if m["pillar_iou"] is not None:
+            pillar_ious.append(m["pillar_iou"])
+            pillar_dices.append(m["pillar_dice"])
+        if m["combined_iou"] is not None:
+            combined_ious.append(m["combined_iou"])
+            combined_dices.append(m["combined_dice"])
+
+        if idx in render_indices:
+            log_rotation_result(f"{tag_prefix}/pair_{case_id}_o{orientation}", orig_label, pred_label, expected_label)
+
+    return {
+        "lump_iou": lump_ious, "lump_dice": lump_dices,
+        "pillar_iou": pillar_ious, "pillar_dice": pillar_dices,
+        "combined_iou": combined_ious, "combined_dice": combined_dices,
+    }
+
+
+def summarize(values: dict) -> dict:
+    """mean of each metric list from evaluate_checkpoint(), nan if empty."""
+    return {f"{k}_mean": (sum(v) / len(v) if v else float("nan")) for k, v in values.items()}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare rotate180 checkpoints on held-out validation pairs with exact ground truth.")
@@ -100,55 +154,26 @@ def main():
         ckpt_name = ckpt_path.stem
         print(f"[eval_rotate180] {ckpt_name} (epoch {epoch_trained})...")
 
-        lump_ious, lump_dices, pillar_ious, pillar_dices, combined_ious, combined_dices = [], [], [], [], [], []
+        values = evaluate_checkpoint(model, val_ds, eval_indices, device, args.n_steps, method=args.method,
+                                      render_indices=render_indices, tag_prefix=f"eval/{ckpt_name}")
+        s = summarize(values)
 
-        for idx in eval_indices:
-            x0, x1 = val_ds[idx]
-            case_id, variant_idx, orientation = val_ds.index[idx]
-            x1_hat = sample(model, args.n_steps, x0=x0.unsqueeze(0).to(device), device=device,
-                             method=args.method, t_start=0.0, t_end=1.0)
-            pred_label = x1_hat.argmax(dim=1)[0].cpu()
-            expected_label = x1.argmax(dim=0)
-            orig_label = x0.argmax(dim=0)
-
-            m = rotation_metrics(pred_label, expected_label)
-            if m["lump_iou"] is not None:
-                lump_ious.append(m["lump_iou"])
-                lump_dices.append(m["lump_dice"])
-            if m["pillar_iou"] is not None:
-                pillar_ious.append(m["pillar_iou"])
-                pillar_dices.append(m["pillar_dice"])
-            if m["combined_iou"] is not None:
-                combined_ious.append(m["combined_iou"])
-                combined_dices.append(m["combined_dice"])
-
-            if idx in render_indices:
-                log_rotation_result(f"eval/{ckpt_name}/pair_{case_id}_o{orientation}",
-                                     orig_label, pred_label, expected_label)
-
-        lump_iou_mean = sum(lump_ious) / len(lump_ious) if lump_ious else float("nan")
-        lump_dice_mean = sum(lump_dices) / len(lump_dices) if lump_dices else float("nan")
-        pillar_iou_mean = sum(pillar_ious) / len(pillar_ious) if pillar_ious else float("nan")
-        pillar_dice_mean = sum(pillar_dices) / len(pillar_dices) if pillar_dices else float("nan")
-        combined_iou_mean = sum(combined_ious) / len(combined_ious) if combined_ious else float("nan")
-        combined_dice_mean = sum(combined_dices) / len(combined_dices) if combined_dices else float("nan")
-
-        print(f"  lump_IoU={lump_iou_mean:.4f}  lump_Dice={lump_dice_mean:.4f}  "
-              f"pillar_IoU={pillar_iou_mean:.4f}  pillar_Dice={pillar_dice_mean:.4f}  "
-              f"combined_IoU={combined_iou_mean:.4f}  combined_Dice={combined_dice_mean:.4f}")
+        print(f"  lump_IoU={s['lump_iou_mean']:.4f}  lump_Dice={s['lump_dice_mean']:.4f}  "
+              f"pillar_IoU={s['pillar_iou_mean']:.4f}  pillar_Dice={s['pillar_dice_mean']:.4f}  "
+              f"combined_IoU={s['combined_iou_mean']:.4f}  combined_Dice={s['combined_dice_mean']:.4f}")
 
         wandb.log({
             "checkpoint_epoch": epoch_trained,
-            "eval/lump_iou_mean": lump_iou_mean,
-            "eval/lump_dice_mean": lump_dice_mean,
-            "eval/pillar_iou_mean": pillar_iou_mean,
-            "eval/pillar_dice_mean": pillar_dice_mean,
-            "eval/combined_iou_mean": combined_iou_mean,
-            "eval/combined_dice_mean": combined_dice_mean,
+            "eval/lump_iou_mean": s["lump_iou_mean"],
+            "eval/lump_dice_mean": s["lump_dice_mean"],
+            "eval/pillar_iou_mean": s["pillar_iou_mean"],
+            "eval/pillar_dice_mean": s["pillar_dice_mean"],
+            "eval/combined_iou_mean": s["combined_iou_mean"],
+            "eval/combined_dice_mean": s["combined_dice_mean"],
         })
-        table.add_data(ckpt_name, epoch_trained, lump_iou_mean, lump_dice_mean, pillar_iou_mean, pillar_dice_mean,
-                        combined_iou_mean, combined_dice_mean)
-        summary_rows.append((ckpt_name, epoch_trained, combined_dice_mean))
+        table.add_data(ckpt_name, epoch_trained, s["lump_iou_mean"], s["lump_dice_mean"],
+                        s["pillar_iou_mean"], s["pillar_dice_mean"], s["combined_iou_mean"], s["combined_dice_mean"])
+        summary_rows.append((ckpt_name, epoch_trained, s["combined_dice_mean"]))
 
     wandb.log({"eval/summary_table": table})
 
