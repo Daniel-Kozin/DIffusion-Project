@@ -71,9 +71,9 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
     hs = [p[1] if p is not None else fallback[1] for p in frame_positions]
 
     left_cols = 3
-    half = max(n_frames // 2, 1)
-    fig = plt.figure(figsize=(3 + 1.8 * n_frames, 6.5))
-    gs = fig.add_gridspec(2, left_cols + n_frames, height_ratios=[1.3, 1])
+    top_w = max(n_frames // 5, 1)  # small, fixed-size orig/pred panels (not half the row)
+    fig = plt.figure(figsize=(2.6 * n_frames, 9.5))
+    gs = fig.add_gridspec(2, left_cols + n_frames, height_ratios=[0.7, 1.8])
 
     # --- left: lump centroid position at every t, connected and color-graded by t ---
     ax_left = fig.add_subplot(gs[:, 0:left_cols])
@@ -103,9 +103,9 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
     # span multiple filmstrip columns (wide, short box) while row1 cells are ~square, and
     # imshow's aspect can otherwise be silently overridden by the containing GridSpec cell's
     # box shape, stretching the (square) render non-uniformly -- same array, distorted display.
-    ax_orig = fig.add_subplot(gs[0, left_cols:left_cols + half])
+    ax_orig = fig.add_subplot(gs[0, left_cols:left_cols + top_w])
     ax_orig.imshow(frame_imgs[0], aspect="equal")
-    ax_orig.set_title("original (t=0)", fontsize=11, color="tab:blue")
+    ax_orig.set_title("original (t=0)", fontsize=10, color="tab:blue")
     ax_orig.set_xticks([])
     ax_orig.set_yticks([])
     for spine in ax_orig.spines.values():
@@ -113,23 +113,25 @@ def render_trajectory_figure(model, x0: torch.Tensor, x1: torch.Tensor, n_steps:
         spine.set_edgecolor("tab:blue")
         spine.set_linewidth(3)
 
-    ax_pred = fig.add_subplot(gs[0, left_cols + half:left_cols + n_frames])
+    ax_pred = fig.add_subplot(gs[0, left_cols + top_w:left_cols + 2 * top_w])
     ax_pred.imshow(frame_imgs[-1], aspect="equal")
-    ax_pred.set_title("predicted (t=1)", fontsize=11, color="tab:red")
+    ax_pred.set_title("predicted (t=1)", fontsize=10, color="tab:red")
     ax_pred.set_xticks([])
     ax_pred.set_yticks([])
     for spine in ax_pred.spines.values():
         spine.set_visible(True)
         spine.set_edgecolor("tab:red")
         spine.set_linewidth(3)
+    # remaining row0 columns to the right of orig/pred are left blank on purpose -- they keep
+    # the small original/predicted panels from stretching to fill the full filmstrip width
 
-    # --- bottom right: every frame, in order ---
+    # --- bottom right: every frame, in order (the main event -- given the most space) ---
     for col in range(n_frames):
         ax = fig.add_subplot(gs[1, left_cols + col])
         ax.imshow(frame_imgs[col], aspect="equal")
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title(f"t={t_values[col]:.2f}", fontsize=8)
+        ax.set_title(f"t={t_values[col]:.2f}", fontsize=10)
         color = "tab:blue" if col == 0 else ("tab:red" if col == n_frames - 1 else "gray")
         for spine in ax.spines.values():
             spine.set_visible(True)
