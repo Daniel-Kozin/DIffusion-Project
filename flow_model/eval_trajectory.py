@@ -107,6 +107,10 @@ def main():
                               "the combined-Dice distribution (a good + a bad + a middling "
                               "example), 'best'/'worst' = top/bottom by final combined Dice, "
                               "'random' = uniform random pick.")
+    parser.add_argument("--eval_train_too", type=lambda v: str(v).lower() in ("1", "true", "yes"), default=False,
+                         help="Also evaluate a matching-size random sample of TRAINING pairs, logged "
+                              "alongside the validation numbers -- directly checks overfitting "
+                              "(train much better than val => memorizing, not generalizing).")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--wandb_project", type=str, default="diffusion_project")
     parser.add_argument("--wandb_mode", type=str, default="online")
@@ -117,12 +121,12 @@ def main():
     model, epoch_trained = load_model_from_checkpoint(args.checkpoint, device)
     print(f"[eval_trajectory] checkpoint epoch {epoch_trained}")
 
-    _, val_ds = build_rotation_pair_datasets(args.data_dir, val_frac=args.val_frac,
-                                              seed=args.seed, num_classes=args.num_classes)
+    train_ds, val_ds = build_rotation_pair_datasets(args.data_dir, val_frac=args.val_frac,
+                                                      seed=args.seed, num_classes=args.num_classes)
     val_case_ids = sorted({val_ds.index[i][0] for i in range(len(val_ds))})
     print(f"[eval_trajectory] val_frac={args.val_frac} seed={args.seed} -> "
           f"{len(val_case_ids)} val case_ids: {val_case_ids}")
-    print(f"[eval_trajectory] {len(val_ds)} val pairs total")
+    print(f"[eval_trajectory] {len(val_ds)} val pairs total, {len(train_ds)} train pairs total")
     if len(val_ds) == 0:
         raise RuntimeError("No validation pairs found -- check --data_dir/--val_frac/--seed")
 
@@ -138,17 +142,34 @@ def main():
         run_name = f"{run_name}_{args.run_tag}"
     wandb.init(project=args.wandb_project, mode=args.wandb_mode, name=run_name, config=vars(args))
 
-    # --- 1. full-dataset metrics, including spread (not just mean) ---
+    def report(tag: str, values: dict) -> None:
+        s = summarize(values)
+        sp = spread(values)
+        print(f"[eval_trajectory][{tag}] combined_dice: mean={s['combined_dice_mean']:.4f}  "
+              f"std={sp['combined_dice_std']:.4f}  min={sp['combined_dice_min']:.4f}  max={sp['combined_dice_max']:.4f}")
+        print(f"[eval_trajectory][{tag}] lump_dice:     mean={s['lump_dice_mean']:.4f}  "
+              f"std={sp['lump_dice_std']:.4f}  min={sp['lump_dice_min']:.4f}  max={sp['lump_dice_max']:.4f}")
+        print(f"[eval_trajectory][{tag}] pillar_dice:   mean={s['pillar_dice_mean']:.4f}  "
+              f"std={sp['pillar_dice_std']:.4f}  min={sp['pillar_dice_min']:.4f}  max={sp['pillar_dice_max']:.4f}")
+        wandb.log({"checkpoint_epoch": epoch_trained, **{f"full_eval_{tag}/{k}": v for k, v in {**s, **sp}.items()}})
+
+    # --- 1. full validation-set metrics, including spread (not just mean) ---
     values = evaluate_checkpoint(model, val_ds, eval_indices, device, args.n_steps, method=args.method)
-    s = summarize(values)
-    sp = spread(values)
-    print(f"[eval_trajectory] combined_dice: mean={s['combined_dice_mean']:.4f}  "
-          f"std={sp['combined_dice_std']:.4f}  min={sp['combined_dice_min']:.4f}  max={sp['combined_dice_max']:.4f}")
-    print(f"[eval_trajectory] lump_dice:     mean={s['lump_dice_mean']:.4f}  "
-          f"std={sp['lump_dice_std']:.4f}  min={sp['lump_dice_min']:.4f}  max={sp['lump_dice_max']:.4f}")
-    print(f"[eval_trajectory] pillar_dice:   mean={s['pillar_dice_mean']:.4f}  "
-          f"std={sp['pillar_dice_std']:.4f}  min={sp['pillar_dice_min']:.4f}  max={sp['pillar_dice_max']:.4f}")
-    wandb.log({"checkpoint_epoch": epoch_trained, **{f"full_eval/{k}": v for k, v in {**s, **sp}.items()}})
+    report("val", values)
+
+    # --- 1b. optional: matching-size train-set sample, to check overfitting ---
+    if args.eval_train_too:
+        n_train_sample = min(len(eval_indices), len(train_ds))
+        train_indices = rng.sample(range(len(train_ds)), n_train_sample)
+        print(f"[eval_trajectory] evaluating {len(train_indices)} TRAIN pairs for comparison...")
+        train_values = evaluate_checkpoint(model, train_ds, train_indices, device, args.n_steps, method=args.method)
+        report("train", train_values)
+        val_dice = summarize(values)["combined_dice_mean"]
+        train_dice = summarize(train_values)["combined_dice_mean"]
+        gap = train_dice - val_dice
+        print(f"[eval_trajectory] train-val combined_dice gap: {gap:+.4f} "
+              f"({'overfitting signal' if gap > 0.1 else 'no strong overfitting signal'})")
+        wandb.log({"full_eval_train_val_gap/combined_dice": gap})
 
     # histogram of the per-pair distribution -- the mean alone has repeatedly hidden
     # bimodal/high-variance behavior on this task
@@ -158,7 +179,7 @@ def main():
     ax.set_ylabel("# validation pairs")
     ax.set_title(f"Per-pair combined Dice distribution (n={len(values['combined_dice'])})")
     plt.tight_layout()
-    wandb.log({"full_eval/combined_dice_histogram": wandb.Image(fig_hist)})
+    wandb.log({"full_eval_val/combined_dice_histogram": wandb.Image(fig_hist)})
     plt.close(fig_hist)
 
     # --- 2. t=0->1 trajectory visualization for a handful of example pairs ---
