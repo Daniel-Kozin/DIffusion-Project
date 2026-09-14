@@ -302,9 +302,9 @@ We use two families of metric, computed directly on the generated label volume. 
 MAE} compares, for a pair $(A,B)$ at mixing fraction $\alpha$, the naively expected lump position
 $p_{\text{expected}}(\alpha) = (1-\alpha)p_A + \alpha p_B$ against the actual centroid of the
 generated lump, averaged over all pair-$\alpha$ combinations. \textbf{Component counts} apply 3D
-connected-component labeling to the generated foreground and lump masks; real single-lump
-phantoms have exactly one connected component of each, so a value of 1 is the target and larger
-values indicate torn, fragmented anatomy.
+connected-component labeling to the generated foreground and lump masks; real phantoms have
+exactly one connected lump component and four connected anatomy components, so these are the
+target values and larger counts indicate torn, fragmented anatomy.
 
 \subsection{$t_{\text{mid}}$ results and analysis}
 We swept $t_{\text{mid}}$ from $0.1$ to $0.9$ on 20 real-phantom pairs $\times$ 3 mixing
