@@ -462,22 +462,21 @@ the 20--60 range to mostly 2--14, but, as the next section shows, mask overlap w
 target remained low.
 
 \subsection{Evaluation metric: mask overlap}
-Directly computing intersection-over-union and Dice between the predicted and true binary lump
-mask,
+Directly computing the Dice coefficient between the predicted and true binary lump mask,
 \begin{equation}
-\mathrm{IoU} = \frac{|A\cap B|}{|A\cup B|}, \qquad \mathrm{Dice} = \frac{2|A\cap B|}{|A|+|B|},
+\mathrm{Dice} = \frac{2|A\cap B|}{|A|+|B|},
 \end{equation}
-gave mean IoU $\approx0.07$ and Dice $\approx0.13$ across ten validation pairs after adding the
-Dice term, decay schedule, and EMA,
-nonzero and therefore meaningful, since the two positions are always $180^\circ$ apart and can
-never overlap by chance, but far from good. A small blob that happens to contain one true voxel
-can score a near-zero IoU while its centroid looks correct, which is exactly why mask overlap
-(not centroid distance) is used as the trusted metric throughout the remainder of this section.
+gave a mean of only $\approx0.13$ across ten validation pairs after adding the Dice term, decay
+schedule, and EMA, nonzero and therefore meaningful, since the two positions are always
+$180^\circ$ apart and can never overlap by chance, but far from good. A small blob that happens
+to contain one true voxel can score near-zero overlap while its centroid looks correct, which is
+exactly why mask overlap (not centroid distance) is used as the trusted metric throughout the
+remainder of this section.
 
 \subsection{Diagnosis: exposure bias, not numerical error}
 Before revisiting the loss again, we tested whether integration accuracy was the bottleneck:
 switching the sampler from Euler to Heun's method, and separately tripling the step count from
-30 to 100, both left mean combined IoU essentially unchanged ($0.094\to0.094\to0.090$). This
+30 to 100, both left mean combined mask overlap essentially unchanged. This
 rules out discretization error and points to \emph{exposure bias}: the network is only ever
 trained at points exactly on the straight line between a real $(x_0,x_1)$ pair, so it fits that
 narrow, teacher-forced objective well, but at inference it must integrate its own predicted
