@@ -564,47 +564,6 @@ final prediction.}
 \label{fig:final-traj}
 \end{figure}
 
-\section{Discussion}
-Table~\ref{tab:milestones} tracks combined mask Dice across the rotation task's major modeling
-stages end to end. The rollout-consistency fix is responsible for roughly a $3.5\times$
-improvement in combined Dice over the previous best measured result.
-
-\begin{table}[H]
-\centering
-\small
-\begin{tabular}{@{}p{5.0cm}ccp{4.6cm}@{}}
-\toprule
-Stage & Comb.\ Dice & Lump Dice & Notes \\
-\midrule
-Velocity MSE only & n/a & n/a & prediction never moves off $x_0$ \\
-$+$ cross-entropy endpoint & n/a & n/a & moves, but a $\sim$20--60-component blob \\
-$+$ Dice loss, decay, EMA & 0.13 & n/a & blob fixed; still low overlap \\
-$+$ rollout-consistency fine-tune & \textbf{0.453} & \textbf{0.472} & final model, epoch 1250 EMA, full 176-pair validation \\
-\bottomrule
-\end{tabular}
-\caption{Combined mask Dice across the project's major modeling stages on the rotation task.}
-\label{tab:milestones}
-\end{table}
-
-Two lessons carried across both parts of this project. First, flow matching's lack of a
-compression bottleneck is a genuine trade-off, not a free lunch: it is exactly what gives
-individual samples and individual-phantom inversion their sharpness, and exactly why the space
-it learns is never pushed to be smoothly organized as a whole, which is what real
-phantom-to-phantom interpolation would have needed. Second, metrics that ignore the underlying
-class imbalance are actively misleading on this data: a model that changes nothing can still
-score 91.6\% voxel agreement or a deceptively small centroid error, because the classes that
-matter make up under one percent of every volume; mask overlap on those specific classes was the
-metric that actually tracked whether the model had learned anything.
-
-\paragraph{Limitations.} The dataset is small (40 case IDs, expanded to 984 volumes only through
-rotation augmentation), so both the interpolation failure and the rotation-task results should
-be read as findings on this specific phantom dataset rather than as general claims about flow
-matching at larger scale. The rotation task also sidesteps rather than repairs the original
-interpolation goal: it demonstrates that the same velocity field can be trained to hit an exact
-target reliably, but it does not, on its own, establish that arbitrary real-to-real interpolation
-would work if the same fixes (rollout consistency in particular) were applied back to that
-setting.
-
 \section{Conclusion}
 Interpolating between real phantoms by inverting to noise, blending, and integrating forward did
 not work on this dataset, and the failure persisted across more training, a class-weighted loss,
