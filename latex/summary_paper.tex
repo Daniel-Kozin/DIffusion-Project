@@ -11,7 +11,7 @@
 
 \title{\textbf{Learning Transformations Between Breast-Phantom Volumes with Flow Matching}\\[4pt]
 \large From a Failed Interpolation Attempt to a Validated 180\textdegree{} Rotation Task}
-\author{Daniel Kozin \\ \small ID 215550260 \\ \small Diffusion Models --- Course Project}
+\author{Daniel Kozin \\ \small ID 215550260 \\ \small Diffusion Models, Course Project}
 \date{}
 
 \begin{document}
@@ -28,7 +28,7 @@ failure that persists across more training, a class-weighted loss, more integrat
 a partial-inversion variant of the method. We trace this to a structural property of flow
 matching rather than a bug: with no compression bottleneck, nothing in training constrains the
 region between two different real phantoms' noise pre-images. We then pivot to a
-self-supervised task with exact ground truth --- predicting a phantom rotated $180^\circ$ ---
+self-supervised task with exact ground truth, predicting a phantom rotated $180^\circ$,
 which lets us iterate against a known-correct answer instead of visual judgment alone. A
 sequence of diagnosed failures (an undercommitted velocity field, an over-permissive
 cross-entropy term, and finally exposure bias between teacher-forced training and the model's
@@ -47,15 +47,15 @@ voxel-space crossfade would produce. This project set out to test that idea on a
 breast-phantom volumes: invert two real phantoms into the model's noise space, interpolate, and
 generate the volume in between. That attempt did not work, for reasons that turn out to be
 informative about what flow matching does and does not guarantee. We diagnose the failure, then
-pivot to a task the model \emph{can} be trained and evaluated on with exact ground truth ---
-predicting a $180^\circ$ rotation of a phantom --- and report the sequence of loss and
+pivot to a task the model \emph{can} be trained and evaluated on with exact ground truth,
+predicting a $180^\circ$ rotation of a phantom, and report the sequence of loss and
 evaluation fixes that took that second task from a model that never moves its prediction at all
 to one with a validated combined mask Dice of $0.453$.
 
 \section{Data}
 Each phantom is a 3D voxel volume ($26$ depth slices $\times\,128\times128$), with every voxel
 labeled as one of four classes: background, insert (the overall phantom surface), pillar
-(holding the lump in place), or lump --- the class that matters medically, and the rarest one.
+(holding the lump in place), or lump, the class that matters medically, and the rarest one.
 After removing double/triple-lump phantoms (out of scope for this single-lump framing), 123
 files across 40 case IDs remain, expanded to 984 volumes via $8\times$ in-plane rotation
 augmentation. Figure~\ref{fig:dataset} shows four examples, and Table~\ref{tab:balance} gives
@@ -146,7 +146,7 @@ and integrate the result forward through $v_\theta$ back to a label volume
 A plain linear blend of two Gaussian noise vectors is the wrong operation: in a space of
 dimension $d\approx 1.7\times10^6$ (four channels $\times$ 26 $\times$ 128 $\times$ 128), two
 independent Gaussian samples concentrate tightly around a shell of radius $\sqrt d$, while their
-average has expected norm only $\sqrt{d/2}\approx 0.71\sqrt d$ --- two independent, essentially
+average has expected norm only $\sqrt{d/2}\approx 0.71\sqrt d$, since two independent, essentially
 orthogonal random directions of equal length shrink when averaged, the same way two arrows in a
 narrow "V" shrink at their midpoint. This handily quantifies why a linear blend hands the
 network a point from a region of space it never trained on. Spherical interpolation (slerp)
@@ -209,7 +209,7 @@ which rules out both undertraining and numerical discretization error as the cau
     \includegraphics[width=\textwidth]{imgs/summary/interp_broken_example.png}
     \caption{A representative interpolation (pair \texttt{st10dr12}$\leftrightarrow$
     \texttt{st8d10}, $\alpha=0.5$). Left: the naively expected lump position (red star) versus
-    what the model actually generated (green $\times$) --- close in this case. Right: renders of
+    what the model actually generated (green $\times$), close in this case. Right: renders of
     both endpoints and the interpolated result, showing extra bumps and disconnected specks
     absent from either endpoint.}
     \label{fig:interp-broken}
@@ -220,8 +220,8 @@ Flow matching has no compression bottleneck: the noise space has the same dimens
 space, and nothing in the training objective (Eq.~\ref{eq:loss}) pushes it to be organized as a
 whole. Training only ever supervises points that lie exactly on one phantom's own straight-line
 path; with only $\sim10^3$ augmented training volumes scattered across a $\sim1.7\times10^6$
--dimensional space, the neighborhood \emph{between} two different phantoms' paths ---
-particularly near $t=0$, the least-constrained region of all --- is never touched by training.
+-dimensional space, the neighborhood \emph{between} two different phantoms' paths,
+particularly near $t=0$, the least-constrained region of all, is never touched by training.
 We tested a direct mitigation: rather than inverting each phantom all the way to $t=0$, invert
 only \emph{partway} to an intermediate $t_{\text{mid}}>0$, interpolate the two partial
 trajectories there, and integrate forward the remaining distance to $t=1$
@@ -276,7 +276,7 @@ training trajectories actually pass near.
 \node[gray, font=\scriptsize] at (12,-5.2) {$t=1$};
 \end{tikzpicture}%
 }
-\caption{Both rows invert A, invert B, slerp, and integrate forward --- the only difference is
+\caption{Both rows invert A, invert B, slerp, and integrate forward, the only difference is
 how far back each phantom is inverted before interpolating. Both A and B are still inverted
 independently and symmetrically; the proposal only stops the backward integration early.}
 \label{fig:tmid}
@@ -365,7 +365,7 @@ confirmed the framing geometrically: across all 984 augmented instances the spli
 exactly balanced (492/492) with zero ambiguous cases (Figure~\ref{fig:setsplit}), and every
 $(o,o{+}4)$ pair lands on opposite sides by construction. Because $x_0$ is now always real data
 rather than Gaussian noise, generation is a single forward integration (Eq.~\ref{eq:euler-fwd})
-starting from the real $x_0$ --- there is no inversion step, and no noise-space midpoint to be
+starting from the real $x_0$, so there is no inversion step, and no noise-space midpoint to be
 inaccurate about.
 
 \begin{figure}[H]
@@ -384,14 +384,14 @@ epochs, yet the decoded prediction was voxel-for-voxel identical to $x_0$ on eve
 validation pair, unaffected by using up to $20\times$ more integration steps at inference.
 Figure~\ref{fig:baseline} shows a representative example: the predicted lump centroid sits
 directly on top of the original, far from the true $180^\circ$ target, yet gross voxel
-agreement with the target is still 91.6\% --- background and insert dominate the volume closely
+agreement with the target is still 91.6\%, since background and insert dominate the volume closely
 enough between the two orientations that a model which changes nothing at all can still score
 deceptively well on a coarse, class-blind metric. This observation motivated the
 class-sensitive, mask-based metrics used for the rest of this section. Separating the raw
 velocity prediction's \emph{direction} from its \emph{magnitude} (checked against the exact
 training-line target) showed the network already had a consistent directional signal
 (cosine similarity $\approx0.65$); the predicted velocity magnitude was only about 20\% of what
-was needed to actually flip a voxel's class after integration --- an undercommitted regression
+was needed to actually flip a voxel's class after integration, an undercommitted regression
 target, a typical symptom of plain MSE hedging once loss is already fairly low.
 
 \begin{figure}[H]
@@ -427,7 +427,7 @@ both stayed misleadingly reasonable, since a large blob's center of mass can coi
 near the true position. The root cause is specific to how class-weighted cross-entropy is
 computed: the class weight is applied by each voxel's \emph{true} class, not its predicted one,
 so missing a real lump voxel costs up to $12.57\times$ but wrongly predicting lump at a
-true-background voxel costs only $1.0\times$ --- a direct incentive to over-predict the rare
+true-background voxel costs only $1.0\times$, a direct incentive to over-predict the rare
 classes wherever the network is unsure.
 
 \subsection{Fix 2: Dice loss, decaying schedule, and EMA}
@@ -442,8 +442,8 @@ training, since held constant it sustained a $\sim$1.25--1.3$\times$ magnitude o
 hundreds of epochs. An exponential moving average of the model weights (decay $0.999$) was used
 for every evaluation and checkpoint, motivated by the aggregate lump-centroid error swinging
 between roughly 17 and 60 voxels from one 25-epoch checkpoint to the next with no clear trend.
-This combination fixed the gross over-prediction --- predicted lump component counts fell from
-the 20--60 range to mostly 2--14 --- but, as the next section shows, mask overlap with the true
+This combination fixed the gross over-prediction: predicted lump component counts fell from
+the 20--60 range to mostly 2--14, but, as the next section shows, mask overlap with the true
 target remained low.
 
 \subsection{A trustworthy metric: mask overlap}
@@ -452,7 +452,7 @@ mask,
 \begin{equation}
 \mathrm{IoU} = \frac{|A\cap B|}{|A\cup B|}, \qquad \mathrm{Dice} = \frac{2|A\cap B|}{|A|+|B|},
 \end{equation}
-gave mean IoU $\approx0.07$ and Dice $\approx0.13$ across ten validation pairs after Fix 2 ---
+gave mean IoU $\approx0.07$ and Dice $\approx0.13$ across ten validation pairs after Fix 2,
 nonzero and therefore meaningful, since the two positions are always $180^\circ$ apart and can
 never overlap by chance, but far from good. A small blob that happens to contain one true voxel
 can score a near-zero IoU while its centroid looks correct, which is exactly why mask overlap
@@ -470,7 +470,7 @@ line almost immediately.
 
 \subsection{Fix 3: rollout-consistency loss}
 Every loss used so far is computed at a state constructed directly from the known pair
-$(x_0,x_1)$ --- a question with an always-correct answer sitting in the data. At inference,
+$(x_0,x_1)$, a question with an always-correct answer sitting in the data. At inference,
 after the first step, the network instead faces a state \emph{it produced itself}, one it never
 trained on. Rollout loss closes this gap by training on exactly the states the network's own
 multi-step process produces: a short, gradient-tracked rollout from $x_0$ using the model's own
@@ -493,7 +493,7 @@ Every checkpoint saved by the rollout fine-tune was scored under identical condi
 held-out pairs (Table~\ref{tab:checkpoints}). EMA weights beat raw weights at epoch 1250 but
 \emph{lose} to raw weights at epoch 1500: the smoothing that helps mid-run becomes a liability
 once the underlying weights have drifted past their best point. More importantly, training
-longer did not help --- the additional 250 epochs made every EMA metric worse, and only
+longer did not help: the additional 250 epochs made every EMA metric worse, and only
 partially recovered it for raw weights. Epoch 1250 (EMA) is the best model this run produced,
 not the final one.
 
@@ -560,9 +560,9 @@ in combined Dice over the previous best measured result.
 \toprule
 Stage & Comb.\ Dice & Lump Dice & Notes \\
 \midrule
-Velocity MSE only & --- & --- & prediction never moves off $x_0$ \\
-$+$ cross-entropy endpoint & --- & --- & moves, but a $\sim$20--60-component blob \\
-$+$ Dice loss, decay, EMA & 0.13 & --- & blob fixed; still low overlap \\
+Velocity MSE only & n/a & n/a & prediction never moves off $x_0$ \\
+$+$ cross-entropy endpoint & n/a & n/a & moves, but a $\sim$20--60-component blob \\
+$+$ Dice loss, decay, EMA & 0.13 & n/a & blob fixed; still low overlap \\
 $+$ rollout-consistency fine-tune & \textbf{0.453} & \textbf{0.472} & final model, epoch 1250 EMA, full 176-pair validation \\
 \bottomrule
 \end{tabular}
