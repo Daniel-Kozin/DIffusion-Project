@@ -7,6 +7,7 @@
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta, positioning}
 \usepackage{booktabs}
+\usepackage{enumitem}
 \usepackage[colorlinks=true, linkcolor=blue!50!black, citecolor=blue!50!black]{hyperref}
 
 \title{\textbf{Learning Transformations Between Breast-Phantom Volumes with Flow Matching}\\[4pt]
@@ -51,6 +52,48 @@ pivot to a task the model \emph{can} be trained and evaluated on with exact grou
 predicting a $180^\circ$ rotation of a phantom, and report the sequence of loss and
 evaluation fixes that took that second task from a model that never moves its prediction at all
 to one with a validated combined mask Dice of $0.453$.
+
+In summary, this paper:
+\begin{itemize}[noitemsep]
+\item documents why an inversion-slerp-integration approach to phantom interpolation fails, and
+traces the failure to the absence of a compression bottleneck in flow matching rather than to a
+correctable implementation error;
+\item introduces and evaluates a partial-inversion variant of that approach, showing that it
+narrows \emph{where} the model breaks down without fixing \emph{why};
+\item reformulates the underlying problem as a self-supervised $180^\circ$ rotation task with an
+exact, closed-form target, removing the need to judge success by eye alone; and
+\item develops, through a sequence of diagnosed failures, a rollout-consistency loss that raises
+validated combined mask Dice from $0.13$ to $0.453\pm0.151$ on 176 held-out pairs, with no
+evidence of overfitting.
+\end{itemize}
+
+\section{Background: Flow Matching}
+We have a data distribution we can sample from but have no formula for (real phantoms,
+one-hot encoded over the 4 classes so each voxel becomes a length-4 vector), and a distribution
+we understand completely, standard Gaussian noise $x_0\sim\mathcal N(0,I)$ of the same shape.
+Writing a data sample as $x_1$, the simplest path between the two is a straight line,
+\begin{equation}
+x_t = (1-t)\,x_0 + t\,x_1, \qquad t\in[0,1], \label{eq:path}
+\end{equation}
+whose velocity is constant along the path: $\tfrac{d x_t}{dt} = x_1 - x_0 =: v^*$. A network
+$v_\theta(x,t)$ is trained to predict this velocity at randomly sampled points along randomly
+sampled paths,
+\begin{equation}
+\mathcal{L}(\theta) = \mathbb{E}_{t\sim U[0,1],\,x_0\sim\mathcal N(0,I),\,x_1\sim p_{\text{data}}}
+\Big[\, \|v_\theta(x_t,t) - (x_1-x_0)\|^2 \,\Big]. \label{eq:loss}
+\end{equation}
+Generation integrates this field forward from noise; Euler's method with $n$ steps of size
+$\Delta t = 1/n$ repeats
+\begin{equation}
+x_{t+\Delta t} = x_t + v_\theta(x_t,t)\,\Delta t, \label{eq:euler-fwd}
+\end{equation}
+from $x_0$ at $t=0$ to a generated $\hat x_1$ at $t=1$; taking the class-wise argmax turns the
+continuous output back into a discrete label volume. The same field also runs backward: given a
+real $x_1$, integrating
+\begin{equation}
+x_{t-\Delta t} = x_t - v_\theta(x_t,t)\,\Delta t \label{eq:euler-bwd}
+\end{equation}
+from $t=1$ to $t=0$ recovers an approximate noise pre-image $\hat x_0$, i.e.\ \emph{inversion}.
 
 \section{Data}
 Each phantom is a 3D voxel volume ($26$ depth slices $\times\,128\times128$), with every voxel
@@ -98,37 +141,9 @@ Voxel share & 50.8\% & 48.0\% & 0.32\% & 0.94\% \\
 \label{tab:balance}
 \end{table}
 
-\section{Background: Flow Matching}
-We have a data distribution we can sample from but have no formula for (real phantoms,
-one-hot encoded over the 4 classes so each voxel becomes a length-4 vector), and a distribution
-we understand completely, standard Gaussian noise $x_0\sim\mathcal N(0,I)$ of the same shape.
-Writing a data sample as $x_1$, the simplest path between the two is a straight line,
-\begin{equation}
-x_t = (1-t)\,x_0 + t\,x_1, \qquad t\in[0,1], \label{eq:path}
-\end{equation}
-whose velocity is constant along the path: $\tfrac{d x_t}{dt} = x_1 - x_0 =: v^*$. A network
-$v_\theta(x,t)$ is trained to predict this velocity at randomly sampled points along randomly
-sampled paths,
-\begin{equation}
-\mathcal{L}(\theta) = \mathbb{E}_{t\sim U[0,1],\,x_0\sim\mathcal N(0,I),\,x_1\sim p_{\text{data}}}
-\Big[\, \|v_\theta(x_t,t) - (x_1-x_0)\|^2 \,\Big]. \label{eq:loss}
-\end{equation}
-Generation integrates this field forward from noise; Euler's method with $n$ steps of size
-$\Delta t = 1/n$ repeats
-\begin{equation}
-x_{t+\Delta t} = x_t + v_\theta(x_t,t)\,\Delta t, \label{eq:euler-fwd}
-\end{equation}
-from $x_0$ at $t=0$ to a generated $\hat x_1$ at $t=1$; taking the class-wise argmax turns the
-continuous output back into a discrete label volume. The same field also runs backward: given a
-real $x_1$, integrating
-\begin{equation}
-x_{t-\Delta t} = x_t - v_\theta(x_t,t)\,\Delta t \label{eq:euler-bwd}
-\end{equation}
-from $t=1$ to $t=0$ recovers an approximate noise pre-image $\hat x_0$, i.e.\ \emph{inversion}.
+\section{Noise-Space Interpolation Between Real Phantoms}
 
-\section{Part I: Interpolating Between Real Phantoms}
-
-\subsection{Goal and pipeline}
+\subsection{Method overview}
 To morph between two real phantoms A and B, we invert both to noise ($\hat x_0^A, \hat
 x_0^B$), interpolate between the two noise representations at mixing fraction $\alpha\in[0,1]$,
 and integrate the result forward through $v_\theta$ back to a label volume
@@ -182,7 +197,7 @@ Before judging interpolation, we checked the model's ability to invert and recon
 Eq.~\ref{eq:euler-fwd} and compare to the original. This gave 96--99\% voxel agreement at 50
 integration steps across the validation set (98.3\% measured specifically on the lump and
 pillar classes); Figure~\ref{fig:inversion} shows one example. Individual-phantom inversion is
-therefore excellent — the failure diagnosed below is not a symptom of unreliable inversion.
+therefore excellent, so the failure diagnosed below is not a symptom of unreliable inversion.
 
 \begin{figure}[H]
     \centering
@@ -194,7 +209,7 @@ therefore excellent — the failure diagnosed below is not a symptom of unreliab
     \label{fig:inversion}
 \end{figure}
 
-\subsection{Results: interpolation failure modes}
+\subsection{Results}
 Interpolating between two \emph{different} real phantoms was unreliable. Two failure modes
 recurred across pairs: the generated volume sometimes collapsed almost entirely onto one
 endpoint rather than blending; in other cases the predicted lump centroid landed close to the
@@ -215,7 +230,7 @@ which rules out both undertraining and numerical discretization error as the cau
     \label{fig:interp-broken}
 \end{figure}
 
-\subsection{A proposed fix: partial inversion ($t_{\text{mid}}$)}
+\subsection{A partial-inversion variant ($t_{\text{mid}}$)}
 Flow matching has no compression bottleneck: the noise space has the same dimension as the data
 space, and nothing in the training objective (Eq.~\ref{eq:loss}) pushes it to be organized as a
 whole. Training only ever supervises points that lie exactly on one phantom's own straight-line
@@ -282,7 +297,7 @@ independently and symmetrically; the proposal only stops the backward integratio
 \label{fig:tmid}
 \end{figure}
 
-\subsection{Metrics}
+\subsection{Evaluation metrics}
 We use two families of metric, computed directly on the generated label volume. \textbf{Centroid
 MAE} compares, for a pair $(A,B)$ at mixing fraction $\alpha$, the naively expected lump position
 $p_{\text{expected}}(\alpha) = (1-\alpha)p_A + \alpha p_B$ against the actual centroid of the
@@ -291,7 +306,7 @@ connected-component labeling to the generated foreground and lump masks; real si
 phantoms have exactly one connected component of each, so a value of 1 is the target and larger
 values indicate torn, fragmented anatomy.
 
-\subsection{$t_{\text{mid}}$ sweep results and diagnosis}
+\subsection{$t_{\text{mid}}$ results and analysis}
 We swept $t_{\text{mid}}$ from $0.1$ to $0.9$ on 20 real-phantom pairs $\times$ 3 mixing
 fractions (Table~\ref{tab:tmid}). Taken at face value this looks like a real improvement:
 centroid MAE drops by roughly 40\% from $t_{\text{mid}}=0.1$ to its plateau around
@@ -340,7 +355,7 @@ B's lumps appear simultaneously instead of one blended lump.}
 \label{fig:tmid-snap}
 \end{figure}
 
-\subsection{Why interpolation was abandoned}
+\subsection{Summary}
 The network was only ever taught the translation from noise-space position to anatomy \emph{at}
 each individual real phantom's own inverted point; nothing in training ever supervised the
 region between two different phantoms' points, at any $t_{\text{mid}}$. This is a structural
@@ -349,7 +364,7 @@ interpolation procedure itself, so we set the interpolation goal aside and looke
 that could give the model an exact, checkable target instead of one judged only by whether it
 looks anatomically plausible.
 
-\section{Part II: A Self-Supervised 180\textdegree{} Rotation Task}
+\section{A Self-Supervised 180\textdegree{} Rotation Task}
 
 \subsection{Task definition}
 Every phantom is augmented with $8\times$ in-plane rotation at $45^\circ$ increments,
@@ -403,7 +418,7 @@ target, a typical symptom of plain MSE hedging once loss is already fairly low.
     \label{fig:baseline}
 \end{figure}
 
-\subsection{Fix 1: a cross-entropy endpoint loss}
+\subsection{A cross-entropy endpoint term}
 Since $v^*=x_1-x_0$ is constant along the training line, algebra gives an endpoint estimate from
 any point on the trajectory,
 \begin{equation}
@@ -430,7 +445,7 @@ so missing a real lump voxel costs up to $12.57\times$ but wrongly predicting lu
 true-background voxel costs only $1.0\times$, a direct incentive to over-predict the rare
 classes wherever the network is unsure.
 
-\subsection{Fix 2: Dice loss, decaying schedule, and EMA}
+\subsection{Dice regularization, loss schedule, and EMA}
 Three complementary changes addressed the over-prediction. A soft Dice term on the lump/pillar
 channels penalizes false positives symmetrically with false negatives, unlike cross-entropy:
 \begin{equation}
@@ -446,13 +461,14 @@ This combination fixed the gross over-prediction: predicted lump component count
 the 20--60 range to mostly 2--14, but, as the next section shows, mask overlap with the true
 target remained low.
 
-\subsection{A trustworthy metric: mask overlap}
+\subsection{Evaluation metric: mask overlap}
 Directly computing intersection-over-union and Dice between the predicted and true binary lump
 mask,
 \begin{equation}
 \mathrm{IoU} = \frac{|A\cap B|}{|A\cup B|}, \qquad \mathrm{Dice} = \frac{2|A\cap B|}{|A|+|B|},
 \end{equation}
-gave mean IoU $\approx0.07$ and Dice $\approx0.13$ across ten validation pairs after Fix 2,
+gave mean IoU $\approx0.07$ and Dice $\approx0.13$ across ten validation pairs after adding the
+Dice term, decay schedule, and EMA,
 nonzero and therefore meaningful, since the two positions are always $180^\circ$ apart and can
 never overlap by chance, but far from good. A small blob that happens to contain one true voxel
 can score a near-zero IoU while its centroid looks correct, which is exactly why mask overlap
@@ -468,7 +484,7 @@ narrow, teacher-forced objective well, but at inference it must integrate its ow
 velocity forward, and small errors compound as its self-directed trajectory departs from that
 line almost immediately.
 
-\subsection{Fix 3: rollout-consistency loss}
+\subsection{A rollout-consistency loss}
 Every loss used so far is computed at a state constructed directly from the known pair
 $(x_0,x_1)$, a question with an always-correct answer sitting in the data. At inference,
 after the first step, the network instead faces a state \emph{it produced itself}, one it never
@@ -520,7 +536,8 @@ than train Dice, ruling out overfitting as an explanation for the result.
 Figure~\ref{fig:final-traj} shows the full $t{=}0\to1$ trajectory for two held-out pairs: the
 lump visibly separates from its starting position early in the integration and settles close to
 its true $180^\circ$ target, with a clean, compact predicted shape rather than the diffuse
-multi-component blob of Fix~1 or the oversized mass seen at later, overtrained checkpoints.
+multi-component blob produced by the cross-entropy-only model or the oversized mass seen at
+later, overtrained checkpoints.
 
 \begin{table}[H]
 \centering
@@ -548,10 +565,10 @@ final prediction.}
 \label{fig:final-traj}
 \end{figure}
 
-\section{Discussion and Conclusion}
-Table~\ref{tab:milestones} tracks combined mask Dice across the major modeling stages of Part
-II end to end. The rollout-consistency fix is responsible for roughly a $3.5\times$ improvement
-in combined Dice over the previous best measured result.
+\section{Discussion}
+Table~\ref{tab:milestones} tracks combined mask Dice across the rotation task's major modeling
+stages end to end. The rollout-consistency fix is responsible for roughly a $3.5\times$
+improvement in combined Dice over the previous best measured result.
 
 \begin{table}[H]
 \centering
@@ -578,10 +595,28 @@ phantom-to-phantom interpolation would have needed. Second, metrics that ignore 
 class imbalance are actively misleading on this data: a model that changes nothing can still
 score 91.6\% voxel agreement or a deceptively small centroid error, because the classes that
 matter make up under one percent of every volume; mask overlap on those specific classes was the
-metric that actually tracked whether the model had learned anything. Once the evaluation caught
-up to this and the training loss was made to penalize the model's own multi-step behavior
-directly, the rotation task went from a model that never moves its prediction at all to one that
-reliably relocates the lump to its true target, with a validated combined Dice of $0.453 \pm
-0.151$ and no indication of overfitting to the training set.
+metric that actually tracked whether the model had learned anything.
+
+\paragraph{Limitations.} The dataset is small (40 case IDs, expanded to 984 volumes only through
+rotation augmentation), so both the interpolation failure and the rotation-task results should
+be read as findings on this specific phantom dataset rather than as general claims about flow
+matching at larger scale. The rotation task also sidesteps rather than repairs the original
+interpolation goal: it demonstrates that the same velocity field can be trained to hit an exact
+target reliably, but it does not, on its own, establish that arbitrary real-to-real interpolation
+would work if the same fixes (rollout consistency in particular) were applied back to that
+setting.
+
+\section{Conclusion}
+Interpolating between real phantoms by inverting to noise, blending, and integrating forward did
+not work on this dataset, and the failure persisted across more training, a class-weighted loss,
+more integration steps, and a partial-inversion variant, because nothing in flow matching's
+training objective constrains the region between two different real phantoms' noise
+representations. Reformulating the problem as a self-supervised $180^\circ$ rotation task, which
+supplies an exact target for every prediction, made the failure tractable: diagnosing an
+undercommitted velocity field, an over-permissive cross-entropy term, and finally exposure bias
+between teacher-forced training and the model's own multi-step rollout led to a
+rollout-consistency loss that took the task from a model that never moves its prediction at all
+to one that reliably relocates the lump to its true target, with a validated combined Dice of
+$0.453 \pm 0.151$ on 176 held-out pairs and no indication of overfitting to the training set.
 
 \end{document}
